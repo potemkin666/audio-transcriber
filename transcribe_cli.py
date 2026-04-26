@@ -37,6 +37,11 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Number of speakers to label (beta). Example: 2. Omit to disable.",
     )
+    parser.add_argument(
+        "--style",
+        default="per_segment",
+        help="Transcript style: per_segment, paragraph, subtitle_first (default: per_segment).",
+    )
     return parser.parse_args()
 
 
@@ -48,6 +53,8 @@ def main() -> None:
         language=args.language,
         chunk_seconds=max(60, int(args.chunk_minutes) * 60),
         num_speakers=int(args.speakers) if args.speakers and int(args.speakers) > 1 else None,
+        transcript_style=str(args.style or "per_segment"),
+        retain_audio=True,
     )
 
     in_path = Path(args.input).expanduser()

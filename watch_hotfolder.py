@@ -29,6 +29,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--model", default="small", help="Whisper model: tiny, base, small, medium, large.")
     p.add_argument("--language", default="en", help="Language code or blank for auto.")
     p.add_argument("--speakers", type=int, default=None, help="Speaker count (beta). Omit/1 disables.")
+    p.add_argument(
+        "--style",
+        default="per_segment",
+        help="Transcript style: per_segment, paragraph, subtitle_first (default: per_segment).",
+    )
     p.add_argument("--vad", action="store_true", help="Trim leading/trailing silence (fast).")
     p.add_argument("--normalize", action="store_true", help="Apply loudness normalization via ffmpeg.")
     p.add_argument("--denoise", action="store_true", help="Apply light denoise via ffmpeg.")
@@ -113,10 +118,12 @@ def main() -> int:
         language=language,
         chunk_seconds=600,
         num_speakers=num_speakers,
+        transcript_style=str(args.style or "per_segment"),
         redact=bool(args.redact),
         vad=bool(args.vad),
         normalize=bool(args.normalize),
         denoise=bool(args.denoise),
+        retain_audio=True,
     )
 
     if not folder.exists() or not folder.is_dir():

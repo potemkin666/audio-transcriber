@@ -316,6 +316,25 @@ with st.sidebar:
         step=1,
         disabled=(not enable_speakers) or (not speakers_available),
     )
+
+    transcript_style = st.selectbox(
+        "Output style",
+        [
+            ("Per-segment (timestamps)", "per_segment"),
+            ("Paragraphs (grouped)", "paragraph"),
+            ("Subtitle-first", "subtitle_first"),
+        ],
+        index=0,
+        format_func=lambda x: x[0],
+    )[1]
+
+    auto_clean = st.checkbox("Auto-clean audio", value=False, help="Applies safe defaults (VAD + normalize).")
+    vad = st.checkbox("VAD (trim silence)", value=bool(auto_clean), disabled=auto_clean)
+    normalize = st.checkbox("Normalize loudness", value=bool(auto_clean), disabled=auto_clean)
+    denoise = st.checkbox("Light denoise", value=False)
+    redact = st.checkbox("Redact emails/phones", value=False)
+    retain_audio = st.checkbox("Retain audio (playback verify)", value=True)
+
     with st.expander("Advanced"):
         language = st.text_input("Language", value="en")
         show_build = st.checkbox("Show build info", value=False)
@@ -361,6 +380,7 @@ with tabs[0]:
     queue_rows = []
     speakers_on = bool(enable_speakers and speakers_available and int(num_speakers) > 1)
     rtf, samples = get_rtf(model=whisper_model, speakers=speakers_on)
+    throughput = (1.0 / float(rtf)) if (rtf and rtf > 0) else 0.0
     eta_note = f"ETA uses learned speed (samples={samples})" if samples else "ETA uses default speed (no telemetry yet)"
     total_audio_seconds = 0.0
     total_eta_seconds = 0.0
@@ -392,7 +412,10 @@ with tabs[0]:
             }
         )
     st.dataframe(queue_rows, use_container_width=True, hide_index=True)
-    st.caption(f"{eta_note}. Total audio: `{_format_duration(total_audio_seconds)}` • Total ETA: `{_format_eta(total_eta_seconds)}`")
+    st.caption(
+        f"Model `{whisper_model}` • Throughput ~`{throughput:.2f}x` realtime • {eta_note}. "
+        f"Total audio: `{_format_duration(total_audio_seconds)}` • Total ETA: `{_format_eta(total_eta_seconds)}`"
+    )
 
     start = st.button("Transcribe", type="primary", use_container_width=True)
     if not start:
@@ -410,7 +433,12 @@ with tabs[0]:
         language=language.strip() or "en",
         chunk_seconds=600,
         num_speakers=int(num_speakers) if (enable_speakers and speakers_available) else None,
-        retain_audio=True,
+        retain_audio=bool(retain_audio),
+        transcript_style=transcript_style,
+        vad=bool(vad) or bool(auto_clean),
+        normalize=bool(normalize) or bool(auto_clean),
+        denoise=bool(denoise),
+        redact=bool(redact),
     )
 
     with tempfile.TemporaryDirectory(prefix="transcriber-") as tmp:
@@ -596,6 +624,12 @@ with tabs[1]:
             language=(language.strip() or "en"),
             chunk_seconds=600,
             num_speakers=int(num_speakers) if (enable_speakers and speakers_available) else None,
+            retain_audio=bool(retain_audio),
+            transcript_style=transcript_style,
+            vad=bool(vad) or bool(auto_clean),
+            normalize=bool(normalize) or bool(auto_clean),
+            denoise=bool(denoise),
+            redact=bool(redact),
         )
         prepare_whisper_model(options.whisper_model, progress_cb=None)
 
@@ -650,6 +684,15 @@ with tabs[1]:
             cmd.append("--hash")
         if enable_speakers and speakers_available:
             cmd += ["--speakers", str(int(num_speakers))]
+        cmd += ["--style", transcript_style]
+        if bool(vad) or bool(auto_clean):
+            cmd.append("--vad")
+        if bool(normalize) or bool(auto_clean):
+            cmd.append("--normalize")
+        if bool(denoise):
+            cmd.append("--denoise")
+        if bool(redact):
+            cmd.append("--redact")
 
         lf = log_path.open("a", encoding="utf-8")
         lf.write("\n--- START watcher ---\n")
