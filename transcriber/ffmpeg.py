@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import json
 from pathlib import Path
 
 
@@ -42,6 +43,37 @@ def ensure_ffmpeg_available() -> None:
     subprocess.run([ffprobe, "-version"], check=True, capture_output=True)
 
 
+def find_ffmpeg_tools() -> dict[str, str] | None:
+    ffmpeg = _find_ffmpeg_exe("ffmpeg")
+    ffprobe = _find_ffmpeg_exe("ffprobe")
+    if not ffmpeg or not ffprobe:
+        return None
+    return {"ffmpeg": ffmpeg, "ffprobe": ffprobe}
+
+
+def _first_line(cmd: list[str]) -> str | None:
+    try:
+        p = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        out = (p.stdout or "").splitlines()
+        return out[0].strip() if out else None
+    except Exception:
+        return None
+
+
+def ffmpeg_version_line() -> str | None:
+    tools = find_ffmpeg_tools()
+    if not tools:
+        return None
+    return _first_line([tools["ffmpeg"], "-version"])
+
+
+def ffprobe_version_line() -> str | None:
+    tools = find_ffmpeg_tools()
+    if not tools:
+        return None
+    return _first_line([tools["ffprobe"], "-version"])
+
+
 def probe_duration_seconds(path: str) -> float | None:
     ffprobe = _find_ffmpeg_exe("ffprobe")
     if not ffprobe:
@@ -63,6 +95,35 @@ def probe_duration_seconds(path: str) -> float | None:
             text=True,
         )
         return float(p.stdout.strip())
+    except Exception:
+        return None
+
+
+def probe_media(path: str) -> dict | None:
+    """
+    Rich ffprobe JSON: format + streams.
+    Returns None if ffprobe is missing or probing fails.
+    """
+    ffprobe = _find_ffmpeg_exe("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        p = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_format",
+                "-show_streams",
+                "-print_format",
+                "json",
+                path,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return json.loads(p.stdout or "{}")
     except Exception:
         return None
 
@@ -121,3 +182,50 @@ def split_to_wav_chunks(
     for i, p in enumerate(chunks):
         results.append((os.fspath(p), i * int(chunk_seconds)))
     return results
+
+
+def convert_to_audio_16k_mono(
+    *,
+    in_path: str,
+    out_path: str,
+    fmt: str,
+    audio_filters: str | None = None,
+) -> None:
+    """
+    Creates a single 16kHz mono audio file for playback/verification.
+    fmt:
+      - "wav" (pcm_s16le)
+      - "mp3" (low-bitrate preview)
+    """
+    ffmpeg = _find_ffmpeg_exe("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found on PATH.")
+
+    out_p = Path(out_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        in_path,
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+    ]
+    if audio_filters:
+        cmd += ["-af", audio_filters]
+
+    if fmt == "wav":
+        cmd += ["-c:a", "pcm_s16le", out_path]
+    elif fmt == "mp3":
+        # Low bitrate preview; small enough to embed in the UI.
+        cmd += ["-c:a", "libmp3lame", "-b:a", "64k", out_path]
+    else:
+        raise ValueError(f"Unsupported fmt: {fmt}")
+
+    subprocess.run(cmd, check=True)

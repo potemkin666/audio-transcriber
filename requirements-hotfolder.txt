@@ -1,0 +1,3 @@
+# Optional hot-folder auto-watch dependency
+watchdog>=4.0
+

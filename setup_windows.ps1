@@ -126,6 +126,7 @@ Write-Info "Installing Python deps..."
 & ".\\.venv\\Scripts\\python.exe" -m pip install -U pip | Out-Host
 & ".\\.venv\\Scripts\\python.exe" -m pip install -r requirements.txt | Out-Host
 Write-Info "Optional: run Setup-Speakers.cmd to enable speaker labels (beta)."
+Write-Info "Optional: install hot-folder auto-watch: pip install -r requirements-hotfolder.txt"
 
 Write-Info "Generating icon..."
 New-Item -ItemType Directory -Force -Path ".\\assets" | Out-Null

@@ -10,4 +10,5 @@ if errorlevel 1 (
 )
 echo.
 echo Setup complete. You can now double-click the Desktop icon: TRANSCRIBER
+echo Optional: run Setup-Speakers.cmd (speaker labels) or install hot-folder watch: pip install -r requirements-hotfolder.txt
 pause

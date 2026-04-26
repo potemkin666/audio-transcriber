@@ -16,7 +16,7 @@ import whisper
 import requests
 import numpy as np
 
-from .ffmpeg import ensure_ffmpeg_available, split_to_wav_chunks
+from .ffmpeg import ensure_ffmpeg_available, probe_media, split_to_wav_chunks, convert_to_audio_16k_mono
 from .formats import (
     Segment,
     segments_to_paragraphs,
@@ -27,6 +27,8 @@ from .formats import (
     segments_to_vtt,
 )
 from .speakers import label_speakers_from_windows
+from .report import write_brief_pack
+from .telemetry import update_rtf
 
 
 ProgressCallback = Callable[[float, str], None] | None
@@ -44,6 +46,7 @@ class TranscriptionOptions:
     vad: bool = False
     normalize: bool = False
     denoise: bool = False
+    retain_audio: bool = False
 
 
 @dataclass(frozen=True)
@@ -61,9 +64,9 @@ def _app_whisper_download_root() -> Path:
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA")
         if base:
-            return Path(base) / "mp3-transcriber" / "whisper"
+            return Path(base) / "transcriber" / "whisper"
     # Fallback for non-Windows / missing env.
-    return Path(os.path.expanduser("~")) / ".cache" / "mp3-transcriber" / "whisper"
+    return Path(os.path.expanduser("~")) / ".cache" / "transcriber" / "whisper"
 
 
 def _whisper_model_url(name: str) -> str | None:
@@ -119,7 +122,7 @@ def ensure_whisper_model_downloaded(name: str, progress_cb: ProgressCallback = N
     for attempt in range(1, 4):
         try:
             if progress_cb:
-                progress_cb(0.0, f"Downloading Whisper model '{name}' (attempt {attempt}/3)…")
+                progress_cb(0.0, f"Downloading Whisper model '{name}' (attempt {attempt}/3)...")
 
             if part_file.exists():
                 try:
@@ -142,7 +145,7 @@ def ensure_whisper_model_downloaded(name: str, progress_cb: ProgressCallback = N
                         downloaded += len(chunk)
 
                         if progress_cb and total > 0:
-                            progress_cb(min(0.999, downloaded / total), "Downloading model…")
+                            progress_cb(min(0.999, downloaded / total), "Downloading model...")
 
             if h.hexdigest() != expected_sha256:
                 raise RuntimeError("Downloaded model SHA256 mismatch.")
@@ -294,6 +297,7 @@ def transcribe_file(
     progress_cb: ProgressCallback,
     preview_cb: PreviewCallback = None,
 ) -> TranscriptionResult:
+    t0 = time.time()
     ensure_ffmpeg_available()
 
     in_path = in_path.resolve()
@@ -302,10 +306,63 @@ def transcribe_file(
     file_out_dir = out_dir / _safe_stem(in_path)
     file_out_dir.mkdir(parents=True, exist_ok=True)
 
+    input_duration: float | None = None
+
+    # Persist rich input metadata for auditability + preflight UX.
+    try:
+        media = probe_media(os.fspath(in_path))
+        if media:
+            (file_out_dir / "media.json").write_text(json.dumps(media, indent=2), encoding="utf-8")
+
+            warnings: list[str] = []
+            suggestions: dict[str, bool] = {}
+            streams = media.get("streams") if isinstance(media, dict) else None
+            audio_streams = [s for s in (streams or []) if isinstance(s, dict) and s.get("codec_type") == "audio"]
+            a0 = audio_streams[0] if audio_streams else {}
+            channels = int(a0.get("channels") or 0)
+            sample_rate = int(float(a0.get("sample_rate") or 0) or 0)
+            codec = (a0.get("codec_name") or "").strip()
+            br = int(float(a0.get("bit_rate") or 0) or 0)
+            if channels >= 2:
+                warnings.append("Stereo source detected; downmixing to mono for ASR.")
+            if sample_rate >= 44100 and channels >= 2 and br >= 192000 and (in_path.suffix.lower() == ".mp3"):
+                warnings.append("Possible music/mixed content (stereo, 44.1kHz+, high bitrate).")
+                suggestions["denoise"] = True
+            if br and br < 64000 and in_path.suffix.lower() in {".mp3", ".m4a", ".mp4", ".aac"}:
+                warnings.append("Low bitrate audio; expect reduced accuracy.")
+                suggestions["normalize"] = True
+
+            (file_out_dir / "preflight.json").write_text(
+                json.dumps(
+                    {
+                        "codec": codec or None,
+                        "channels": channels or None,
+                        "sample_rate": sample_rate or None,
+                        "bit_rate": br or None,
+                        "warnings": warnings,
+                        "suggested_options": suggestions,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            if warnings and progress_cb:
+                progress_cb(0.0, f"Preflight: {warnings[0]}")
+
+            try:
+                fmt = media.get("format") if isinstance(media, dict) else None
+                if isinstance(fmt, dict) and fmt.get("duration") is not None:
+                    input_duration = float(fmt.get("duration"))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     model = _load_whisper_model_cached(options.whisper_model)
 
     if progress_cb:
-        progress_cb(0.0, f"Splitting into ~{options.chunk_seconds // 60} minute chunks…")
+        progress_cb(0.0, f"Splitting into ~{options.chunk_seconds // 60} minute chunks...")
 
     with tempfile.TemporaryDirectory(prefix="transcriber-chunks-") as tmp:
         chunks_dir = Path(tmp)
@@ -316,6 +373,27 @@ def transcribe_file(
             filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
         audio_filters = ",".join(filters) if filters else None
 
+        if options.retain_audio:
+            # Keep playback artifacts for verification + click-to-jump UX.
+            try:
+                convert_to_audio_16k_mono(
+                    in_path=os.fspath(in_path),
+                    out_path=os.fspath(file_out_dir / "audio_preview.mp3"),
+                    fmt="mp3",
+                    audio_filters=audio_filters,
+                )
+            except Exception:
+                pass
+            try:
+                convert_to_audio_16k_mono(
+                    in_path=os.fspath(in_path),
+                    out_path=os.fspath(file_out_dir / "audio.wav"),
+                    fmt="wav",
+                    audio_filters=audio_filters,
+                )
+            except Exception:
+                pass
+
         chunks = split_to_wav_chunks(
             in_path=os.fspath(in_path),
             out_dir=os.fspath(chunks_dir),
@@ -324,6 +402,8 @@ def transcribe_file(
         )
 
         all_segments: list[Segment] = []
+        # Parallel metadata list aligned with all_segments.
+        seg_meta: list[dict] = []
         running_preview = ""
         max_preview_chars = 6000
         want_speakers = bool(options.num_speakers and int(options.num_speakers) > 1)
@@ -333,6 +413,7 @@ def transcribe_file(
         sr = 16000
         win = int(window_seconds * sr)
         total = max(1, len(chunks))
+        first_chunk_stats_written = False
         for i, (chunk_path, offset) in enumerate(chunks, start=1):
             if progress_cb:
                 progress_cb((i - 1) / total, f"Transcribing chunk {i}/{total}...")
@@ -346,7 +427,19 @@ def transcribe_file(
 
             if audio.size > 0:
                 rms = float(np.sqrt(np.mean(audio * audio) + 1e-9))
-                if 20.0 * np.log10(rms + 1e-9) < -55.0:
+                rms_db = 20.0 * np.log10(rms + 1e-9)
+
+                if (not first_chunk_stats_written) and i == 1:
+                    first_chunk_stats_written = True
+                    try:
+                        stats = {"rms_dbfs": float(rms_db), "vad_enabled": bool(options.vad)}
+                        (file_out_dir / "audio_stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
+                        if rms_db < -40.0 and progress_cb:
+                            progress_cb((i - 1) / total, "Warning: audio looks very quiet (expect errors).")
+                    except Exception:
+                        pass
+
+                if rms_db < -55.0:
                     continue
 
             r = model.transcribe(
@@ -363,12 +456,21 @@ def transcribe_file(
                     continue
                 rel_start = float(s.get("start", 0.0))
                 rel_end = float(s.get("end", 0.0))
+
+                whisper_meta = {
+                    "avg_logprob": s.get("avg_logprob"),
+                    "no_speech_prob": s.get("no_speech_prob"),
+                    "compression_ratio": s.get("compression_ratio"),
+                    "temperature": s.get("temperature"),
+                    "tokens": len(s.get("tokens") or []),
+                }
                 if options.redact:
                     text = _redact_text(text)
 
                 start = rel_start + float(offset) + float(trim_start)
                 end = rel_end + float(offset) + float(trim_start)
                 all_segments.append(Segment(start=start, end=end, text=text, speaker="Speaker 1"))
+                seg_meta.append({"whisper": whisper_meta, "speaker_confidence": None})
 
                 if want_speakers:
                     center = (rel_start + rel_end) / 2.0
@@ -400,12 +502,20 @@ def transcribe_file(
             if progress_cb:
                 progress_cb(0.98, "Labeling speakers...")
             diar = label_speakers_from_windows(windows=speaker_windows, num_speakers=int(options.num_speakers or 2))
-            for seg_i, label in zip(speaker_segment_indexes, diar.labels, strict=False):
+            for j, (seg_i, label) in enumerate(zip(speaker_segment_indexes, diar.labels, strict=False)):
                 seg = all_segments[seg_i]
                 all_segments[seg_i] = Segment(start=seg.start, end=seg.end, text=seg.text, speaker=label)
+                if diar.confidence and j < len(diar.confidence) and seg_i < len(seg_meta):
+                    seg_meta[seg_i]["speaker_confidence"] = float(diar.confidence[j])
+
+            try:
+                diar_out = {"num_speakers": int(options.num_speakers or 0), "metrics": diar.metrics or {}}
+                (file_out_dir / "diarization.json").write_text(json.dumps(diar_out, indent=2), encoding="utf-8")
+            except Exception:
+                pass
 
         if progress_cb:
-            progress_cb(1.0, "Writing outputs…")
+            progress_cb(1.0, "Writing outputs...")
 
         txt_plain = segments_to_txt(all_segments)
         style = (options.transcript_style or "per_segment").strip().lower()
@@ -422,14 +532,56 @@ def transcribe_file(
         (file_out_dir / "transcript_plain.txt").write_text(txt_plain, encoding="utf-8")
         (file_out_dir / "transcript.srt").write_text(srt, encoding="utf-8")
         (file_out_dir / "transcript.vtt").write_text(vtt, encoding="utf-8")
+        segments_payload = [
+            {
+                "start": s.start,
+                "end": s.end,
+                "text": s.text,
+                "speaker": s.speaker,
+                **(seg_meta[i] if i < len(seg_meta) else {}),
+            }
+            for i, s in enumerate(all_segments)
+        ]
+
         (file_out_dir / "segments.json").write_text(
-            json.dumps(
-                [{"start": s.start, "end": s.end, "text": s.text, "speaker": s.speaker} for s in all_segments],
-                ensure_ascii=False,
-                indent=2,
-            ),
+            json.dumps(segments_payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+        # Brief Pack (best-effort): leadership-ready summary artifacts.
+        try:
+            extras: dict = {}
+            preflight_path = file_out_dir / "preflight.json"
+            if preflight_path.exists():
+                extras["preflight"] = json.loads(preflight_path.read_text(encoding="utf-8"))
+            write_brief_pack(out_dir=file_out_dir, input_name=in_path.name, segments=segments_payload, extras=extras)
+        except Exception:
+            pass
+
+        # Run telemetry (best-effort): learn per-machine ETA over time.
+        try:
+            elapsed = max(0.0, float(time.time() - t0))
+            if input_duration is None:
+                input_duration = max((float(s.get("end") or 0.0) for s in segments_payload), default=0.0) or None
+            speakers_on = bool(options.num_speakers and int(options.num_speakers) > 1)
+            if input_duration and input_duration > 1.0:
+                rtf = float(elapsed) / float(input_duration)
+                update_rtf(model=options.whisper_model, speakers=speakers_on, rtf=rtf)
+                (file_out_dir / "run_stats.json").write_text(
+                    json.dumps(
+                        {
+                            "elapsed_seconds": elapsed,
+                            "audio_seconds": float(input_duration),
+                            "rtf": rtf,
+                            "model": options.whisper_model,
+                            "speakers": bool(speakers_on),
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+        except Exception:
+            pass
 
     return TranscriptionResult(input_file=in_path, output_dir=file_out_dir)
 
@@ -464,7 +616,7 @@ def transcribe_path(
     total = max(1, len(audio_files))
     for i, p in enumerate(audio_files, start=1):
         if progress_cb:
-            progress_cb((i - 1) / total, f"Transcribing {p.name} ({i}/{total})…")
+            progress_cb((i - 1) / total, f"Transcribing {p.name} ({i}/{total})...")
         results.append(transcribe_file(in_path=p, out_dir=out_dir, options=options, progress_cb=None))
     if progress_cb:
         progress_cb(1.0, "Done.")

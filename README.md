@@ -6,6 +6,7 @@ Local app to transcribe long audio files (UK/English accents are fine) into:
 - `transcript_plain.txt` (plain text)
 - `segments.json` (timestamped segments)
 - `transcript.srt` / `transcript.vtt` (subtitles)
+- `brief.md` / `brief.html` (1-page Brief Pack + copy/paste snippets)
 
 Runs Whisper locally (no uploads required).
 
@@ -45,6 +46,7 @@ streamlit run streamlit_app.py
 
 - Speaker labels are **beta** and work best when you set the correct speaker count (e.g., 2 for an interview).
 - Speaker labels require extra deps: `python -m pip install -r requirements-speakers.txt` (or run `Setup-Speakers.cmd` on Windows).
+- Hot-folder auto-watch requires extra deps: `python -m pip install -r requirements-hotfolder.txt`.
 - Model downloads happen on first run and can take a few minutes.
 
 ## CLI (batch)

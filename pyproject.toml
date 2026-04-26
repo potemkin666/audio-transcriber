@@ -21,6 +21,9 @@ speakers = [
   "scikit-learn>=1.4",
   "torchaudio>=2.0",
 ]
+hotfolder = [
+  "watchdog>=4.0",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
