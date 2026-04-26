@@ -1,0 +1,27 @@
+[project]
+name = "transcriber-local"
+version = "0.1.0"
+description = "Local Streamlit app to transcribe long audio with Whisper (timestamps + optional speaker labels)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+
+dependencies = [
+  "streamlit>=1.33",
+  "openai-whisper>=20231117",
+  "numpy>=1.24",
+  "tqdm>=4.66",
+  "pillow>=10.0",
+  "requests>=2.27",
+]
+
+[project.optional-dependencies]
+speakers = [
+  "speechbrain>=1.0",
+  "scikit-learn>=1.4",
+  "torchaudio>=2.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

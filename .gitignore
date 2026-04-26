@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Streamlit
+.streamlit/
+
+# App runtime
+logs/
+out/
+
+# Bundled tools and downloaded models
+tools/
+
+# OS files
+Thumbs.db
+desktop.ini
+.DS_Store
+

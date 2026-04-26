@@ -1,0 +1,5 @@
+# Optional speaker labeling dependencies (beta diarization)
+speechbrain>=1.0
+scikit-learn>=1.4
+torchaudio>=2.0
+
