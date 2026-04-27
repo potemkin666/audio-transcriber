@@ -414,7 +414,7 @@ with tabs[0]:
     st.dataframe(queue_rows, use_container_width=True, hide_index=True)
     st.caption(
         f"Model `{whisper_model}` • Throughput ~`{throughput:.2f}x` realtime • {eta_note}. "
-        f"Total audio: `{_format_duration(total_audio_seconds)}` • Total ETA: `{_format_eta(total_eta_seconds)}`"
+        f"Estimate: `{_format_eta(total_eta_seconds)}` for `{_format_duration(total_audio_seconds)}` of audio on this machine."
     )
 
     start = st.button("Transcribe", type="primary", use_container_width=True)

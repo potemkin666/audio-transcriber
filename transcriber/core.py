@@ -91,7 +91,11 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def ensure_whisper_model_downloaded(name: str, progress_cb: ProgressCallback = None) -> Path:
+def ensure_whisper_model_downloaded(
+    name: str,
+    progress_cb: ProgressCallback = None,
+    download_stats: dict | None = None,
+) -> Path:
     """
     Downloads model with retries and integrity verification.
     This avoids partial downloads causing Whisper's built-in downloader to repeatedly fail.
@@ -110,6 +114,8 @@ def ensure_whisper_model_downloaded(name: str, progress_cb: ProgressCallback = N
     if model_file.exists():
         try:
             if _sha256_file(model_file) == expected_sha256:
+                if download_stats is not None:
+                    download_stats.update({"cached": True, "attempts": 0})
                 return model_file
         except Exception:
             pass
@@ -118,9 +124,14 @@ def ensure_whisper_model_downloaded(name: str, progress_cb: ProgressCallback = N
         except Exception:
             pass
 
+    if download_stats is not None:
+        download_stats.update({"cached": False, "attempts": 0, "bytes": 0, "content_length": None})
+
     last_err: Exception | None = None
     for attempt in range(1, 4):
         try:
+            if download_stats is not None:
+                download_stats["attempts"] = int(attempt)
             if progress_cb:
                 progress_cb(0.0, f"Downloading Whisper model '{name}' (attempt {attempt}/3)...")
 
@@ -133,6 +144,8 @@ def ensure_whisper_model_downloaded(name: str, progress_cb: ProgressCallback = N
             with requests.get(url, stream=True, timeout=(10, 60)) as r:
                 r.raise_for_status()
                 total = int(r.headers.get("Content-Length", "0") or "0")
+                if download_stats is not None:
+                    download_stats["content_length"] = int(total) if total else None
                 downloaded = 0
                 h = hashlib.sha256()
 
@@ -143,6 +156,8 @@ def ensure_whisper_model_downloaded(name: str, progress_cb: ProgressCallback = N
                         f.write(chunk)
                         h.update(chunk)
                         downloaded += len(chunk)
+                        if download_stats is not None:
+                            download_stats["bytes"] = int(downloaded)
 
                         if progress_cb and total > 0:
                             progress_cb(min(0.999, downloaded / total), "Downloading model...")
@@ -156,6 +171,8 @@ def ensure_whisper_model_downloaded(name: str, progress_cb: ProgressCallback = N
             return model_file
         except Exception as e:
             last_err = e
+            if download_stats is not None:
+                download_stats["last_error"] = str(e)
             time.sleep(0.75 * attempt)
 
     raise RuntimeError(
@@ -298,6 +315,7 @@ def transcribe_file(
     preview_cb: PreviewCallback = None,
 ) -> TranscriptionResult:
     t0 = time.time()
+    t0_perf = time.perf_counter()
     ensure_ffmpeg_available()
 
     in_path = in_path.resolve()
@@ -307,6 +325,31 @@ def transcribe_file(
     file_out_dir.mkdir(parents=True, exist_ok=True)
 
     input_duration: float | None = None
+    run_stats: dict = {
+        "input_name": in_path.name,
+        "input_path": os.fspath(in_path),
+        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "model": options.whisper_model,
+        "language": options.language,
+        "chunk_seconds": int(options.chunk_seconds),
+        "options": {
+            "speakers": int(options.num_speakers or 0),
+            "style": options.transcript_style,
+            "vad": bool(options.vad),
+            "normalize": bool(options.normalize),
+            "denoise": bool(options.denoise),
+            "redact": bool(options.redact),
+            "retain_audio": bool(options.retain_audio),
+        },
+        "timings": {},
+        "chunks": [],
+        "counts": {"segments": 0, "chunks_total": 0, "chunks_used": 0, "chunks_skipped_silence": 0},
+        "warnings": [],
+    }
+    try:
+        run_stats["input_bytes"] = int(in_path.stat().st_size)
+    except Exception:
+        pass
 
     # Persist rich input metadata for auditability + preflight UX.
     try:
@@ -349,17 +392,30 @@ def transcribe_file(
 
             if warnings and progress_cb:
                 progress_cb(0.0, f"Preflight: {warnings[0]}")
+            if warnings:
+                run_stats["warnings"] = list(warnings)
 
             try:
                 fmt = media.get("format") if isinstance(media, dict) else None
                 if isinstance(fmt, dict) and fmt.get("duration") is not None:
                     input_duration = float(fmt.get("duration"))
+                    run_stats["audio_seconds"] = float(input_duration)
             except Exception:
                 pass
     except Exception:
         pass
 
+    # Model cache presence + load timing.
+    try:
+        download_root = _app_whisper_download_root()
+        mf = _whisper_model_file(download_root, options.whisper_model)
+        run_stats["model_cache_present"] = bool(mf and mf.exists())
+    except Exception:
+        pass
+
+    t_model0 = time.perf_counter()
     model = _load_whisper_model_cached(options.whisper_model)
+    run_stats["timings"]["model_load_seconds"] = float(time.perf_counter() - t_model0)
 
     if progress_cb:
         progress_cb(0.0, f"Splitting into ~{options.chunk_seconds // 60} minute chunks...")
@@ -375,6 +431,7 @@ def transcribe_file(
 
         if options.retain_audio:
             # Keep playback artifacts for verification + click-to-jump UX.
+            t_ret0 = time.perf_counter()
             try:
                 convert_to_audio_16k_mono(
                     in_path=os.fspath(in_path),
@@ -393,13 +450,17 @@ def transcribe_file(
                 )
             except Exception:
                 pass
+            run_stats["timings"]["retain_audio_seconds"] = float(time.perf_counter() - t_ret0)
 
+        t_split0 = time.perf_counter()
         chunks = split_to_wav_chunks(
             in_path=os.fspath(in_path),
             out_dir=os.fspath(chunks_dir),
             chunk_seconds=int(options.chunk_seconds),
             audio_filters=audio_filters,
         )
+        run_stats["timings"]["split_seconds"] = float(time.perf_counter() - t_split0)
+        run_stats["counts"]["chunks_total"] = int(len(chunks))
 
         all_segments: list[Segment] = []
         # Parallel metadata list aligned with all_segments.
@@ -414,15 +475,19 @@ def transcribe_file(
         win = int(window_seconds * sr)
         total = max(1, len(chunks))
         first_chunk_stats_written = False
+        transcribe_total = 0.0
         for i, (chunk_path, offset) in enumerate(chunks, start=1):
             if progress_cb:
                 progress_cb((i - 1) / total, f"Transcribing chunk {i}/{total}...")
 
+            chunk_stat: dict = {"i": int(i), "offset": int(offset)}
+            t_chunk0 = time.perf_counter()
             audio = _load_wav_mono_16k_float32(chunk_path)
             trim_start = 0.0
             if options.vad:
                 audio, trim_start = _trim_leading_trailing_silence(audio, sr=16000)
                 if audio.size == 0:
+                    run_stats["counts"]["chunks_skipped_silence"] += 1
                     continue
 
             if audio.size > 0:
@@ -440,8 +505,10 @@ def transcribe_file(
                         pass
 
                 if rms_db < -55.0:
+                    run_stats["counts"]["chunks_skipped_silence"] += 1
                     continue
 
+            chunk_stat["audio_seconds"] = float(audio.shape[0]) / float(sr) if audio.size else 0.0
             r = model.transcribe(
                 audio,
                 task="transcribe",
@@ -450,6 +517,7 @@ def transcribe_file(
                 verbose=False,
             )
 
+            segs_in_chunk = 0
             for s in r.get("segments", []):
                 text = (s.get("text") or "").strip()
                 if not text:
@@ -471,6 +539,7 @@ def transcribe_file(
                 end = rel_end + float(offset) + float(trim_start)
                 all_segments.append(Segment(start=start, end=end, text=text, speaker="Speaker 1"))
                 seg_meta.append({"whisper": whisper_meta, "speaker_confidence": None})
+                segs_in_chunk += 1
 
                 if want_speakers:
                     center = (rel_start + rel_end) / 2.0
@@ -497,6 +566,14 @@ def transcribe_file(
                 if len(running_preview) > max_preview_chars:
                     running_preview = running_preview[-max_preview_chars:]
                 preview_cb(running_preview)
+
+            chunk_elapsed = float(time.perf_counter() - t_chunk0)
+            chunk_stat["transcribe_seconds"] = chunk_elapsed
+            chunk_stat["segments"] = int(segs_in_chunk)
+            transcribe_total += chunk_elapsed
+            run_stats["counts"]["chunks_used"] += 1
+            if len(run_stats["chunks"]) < 600:
+                run_stats["chunks"].append(chunk_stat)
 
         if want_speakers and speaker_windows:
             if progress_cb:
@@ -567,19 +644,19 @@ def transcribe_file(
             if input_duration and input_duration > 1.0:
                 rtf = float(elapsed) / float(input_duration)
                 update_rtf(model=options.whisper_model, speakers=speakers_on, rtf=rtf)
-                (file_out_dir / "run_stats.json").write_text(
-                    json.dumps(
-                        {
-                            "elapsed_seconds": elapsed,
-                            "audio_seconds": float(input_duration),
-                            "rtf": rtf,
-                            "model": options.whisper_model,
-                            "speakers": bool(speakers_on),
-                        },
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
+                run_stats["elapsed_seconds"] = float(elapsed)
+                run_stats["audio_seconds"] = float(input_duration)
+                run_stats["rtf"] = float(rtf)
+                run_stats["timings"]["transcribe_seconds_total"] = float(transcribe_total)
+                run_stats["counts"]["segments"] = int(len(segments_payload))
+        except Exception:
+            pass
+
+        # Always write run_stats.json (best-effort).
+        try:
+            run_stats["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            run_stats["timings"]["total_seconds"] = float(time.perf_counter() - t0_perf)
+            (file_out_dir / "run_stats.json").write_text(json.dumps(run_stats, indent=2), encoding="utf-8")
         except Exception:
             pass
 
