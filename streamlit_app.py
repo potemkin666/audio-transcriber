@@ -743,18 +743,12 @@ with tabs[2]:
 
     files = sorted(transcripts.keys())
     selected = st.selectbox("File", files, index=0)
-    query = st.text_input("Search", value="", placeholder="Type to filter...")
 
     text = transcripts.get(selected, "")
     briefs: dict[str, dict[str, str]] = st.session_state.get("last_briefs") or {}
     segs = (outputs.get(selected) or {}).get("segments") or []
     stem = (outputs.get(selected) or {}).get("stem")
-    if query.strip():
-        q = query.strip().lower()
-        filtered = "\n".join([ln for ln in text.splitlines() if q in ln.lower()])
-        st.text_area("Transcript (filtered)", value=filtered, height=420)
-    else:
-        st.text_area("Transcript", value=text, height=420)
+    query = st.text_input("Search", value="", placeholder="Search segments...")
 
     # Playback sync (best-effort).
     zip_bytes = st.session_state.get("last_zip_bytes")
@@ -813,13 +807,13 @@ with tabs[2]:
             )
             st.audio(audio_bytes)
 
-    # Confidence-highlighted segment view (uses segments.json metadata).
+    # Segment-first transcript view (uses segments.json metadata).
     if segs:
         st.markdown(
             """
             <div class="hud" style="padding:10px 12px; margin-top: 10px;">
-              <div class="micro">SEGMENTS (QA)</div>
-              <div class="sub">Highlights low-confidence lines using Whisper metadata.</div>
+              <div class="micro">SEGMENTS</div>
+              <div class="sub">Search + filter segments. Click a segment to jump playback.</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -849,8 +843,22 @@ with tabs[2]:
                 score *= 0.75
             return float(score)
 
-        only_low = st.checkbox("Show only low-confidence", value=False)
-        threshold = st.slider("Low-confidence threshold", min_value=0.05, max_value=0.75, value=0.35, step=0.05)
+        # Filters
+        speakers = sorted({str((s.get("speaker") or "").strip() or "Speaker") for s in segs})
+        cols = st.columns([2, 2, 2])
+        speaker_filter = cols[0].multiselect("Speaker", options=speakers, default=speakers)
+        min_conf = cols[1].slider("Min confidence", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
+        show_low_only = cols[2].checkbox("Low-confidence only", value=False)
+
+        cols2 = st.columns(3)
+        want_digits = cols2[0].checkbox("Contains digits", value=False)
+        want_questions = cols2[1].checkbox("Questions", value=False)
+        want_caps = cols2[2].checkbox("Capitalized names", value=False)
+
+        # If low-only is enabled, treat as "below threshold" gate.
+        low_threshold = 0.35
+        if show_low_only:
+            low_threshold = st.slider("Low-confidence threshold", min_value=0.05, max_value=0.75, value=0.35, step=0.05)
 
         shown = 0
         blocks: list[str] = []
@@ -859,26 +867,48 @@ with tabs[2]:
             if not txt:
                 continue
             sc = _conf_score(s)
-            if only_low and sc >= float(threshold):
+            if show_low_only and sc >= float(low_threshold):
+                continue
+            if sc < float(min_conf):
                 continue
             start = float(s.get("start") or 0.0)
-            spk = (s.get("speaker") or "").strip()
+            spk = (s.get("speaker") or "").strip() or "Speaker"
+            if speaker_filter and spk not in set(speaker_filter):
+                continue
+            if query.strip():
+                q = query.strip().lower()
+                if q not in txt.lower() and q not in spk.lower():
+                    continue
+            if want_digits and not any(ch.isdigit() for ch in txt):
+                continue
+            if want_questions and "?" not in txt:
+                continue
+            if want_caps and not re.search(r"\b[A-Z][a-z]{2,}\b", txt):
+                continue
             cls = "good"
-            if sc < float(threshold):
+            if sc < float(low_threshold):
                 cls = "low"
-            elif sc < float(threshold) + 0.15:
+            elif sc < float(low_threshold) + 0.15:
                 cls = "mid"
+
+            spk_conf = s.get("speaker_confidence")
+            spk_conf_txt = ""
+            try:
+                if spk_conf is not None:
+                    spk_conf_txt = f" • spk {float(spk_conf):.2f}"
+            except Exception:
+                spk_conf_txt = ""
 
             blocks.append(
                 f"""
                 <div class="seg {cls}" onclick="window.__transcriber_jump && window.__transcriber_jump({start:.3f});">
-                  <div class="seg-h">{_html.escape(_format_duration(start))} <span class="spk">{_html.escape(spk)}</span> <span class="sc">{sc:.2f}</span></div>
+                  <div class="seg-h">{_html.escape(_format_duration(start))} <span class="spk">{_html.escape(spk)}</span> <span class="sc">{sc:.2f}{_html.escape(spk_conf_txt)}</span></div>
                   <div class="seg-t">{_html.escape(txt)}</div>
                 </div>
                 """
             )
             shown += 1
-            if shown >= 120:
+            if shown >= 220:
                 break
 
         st.markdown(
@@ -899,7 +929,27 @@ with tabs[2]:
             """,
             unsafe_allow_html=True,
         )
-        st.markdown("".join(blocks), unsafe_allow_html=True)
+        if blocks:
+            st.markdown("".join(blocks), unsafe_allow_html=True)
+            st.caption(f"Showing up to {shown} segments.")
+        else:
+            st.info("No segments match your filters.")
+
+        with st.expander("Raw transcript", expanded=False):
+            if query.strip():
+                q = query.strip().lower()
+                filtered = "\n".join([ln for ln in text.splitlines() if q in ln.lower()])
+                st.text_area("Transcript (filtered)", value=filtered, height=360)
+            else:
+                st.text_area("Transcript", value=text, height=360)
+    else:
+        # Fallback if segments.json isn't available.
+        if query.strip():
+            q = query.strip().lower()
+            filtered = "\n".join([ln for ln in text.splitlines() if q in ln.lower()])
+            st.text_area("Transcript (filtered)", value=filtered, height=420)
+        else:
+            st.text_area("Transcript", value=text, height=420)
 
     brief = briefs.get(selected)
     if brief:
