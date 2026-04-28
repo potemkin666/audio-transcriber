@@ -15,6 +15,10 @@ Runs Whisper locally (no uploads required).
 1) Double-click `Setup.cmd` once (installs deps, bundles FFmpeg if needed, creates a Desktop shortcut).
 2) Double-click the Desktop icon: `TRANSCRIBER`.
 
+LAN (phone access on same Wi‑Fi):
+
+- Launch with `Launch-LAN.cmd` (binds to `0.0.0.0`) and use the in-app QR code.
+
 ## Manual run (any OS)
 
 You need Python 3.11+ (3.12 is a great default) and FFmpeg available.

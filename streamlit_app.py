@@ -11,9 +11,11 @@ import os
 import subprocess
 import sys
 import time
+import socket
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from transcriber.core import TranscriptionOptions, prepare_whisper_model, transcribe_file
 from transcriber.ffmpeg import ensure_ffmpeg_available, probe_duration_seconds, ffmpeg_version_line, ffprobe_version_line, find_ffmpeg_tools
@@ -54,6 +56,162 @@ def _format_duration(seconds: float | None) -> str:
     if h:
         return f"{h:d}:{m:02d}:{s2:02d}"
     return f"{m:02d}:{s2:02d}"
+
+def _get_local_ip() -> str | None:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return None
+
+
+def _get_qp(name: str) -> str | None:
+    try:
+        v = st.query_params.get(name)
+        if isinstance(v, list):
+            return v[0] if v else None
+        return v
+    except Exception:
+        try:
+            v2 = st.experimental_get_query_params().get(name)  # type: ignore[attr-defined]
+            return v2[0] if v2 else None
+        except Exception:
+            return None
+
+
+def _clear_qp(name: str) -> None:
+    try:
+        if name in st.query_params:
+            del st.query_params[name]
+    except Exception:
+        try:
+            qp = st.experimental_get_query_params()  # type: ignore[attr-defined]
+            qp.pop(name, None)
+            st.experimental_set_query_params(**qp)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
+def _command_palette(commands: list[dict]) -> None:
+    payload = json.dumps(commands)
+    components.html(
+        f"""
+        <div id="tr_cmd_root"></div>
+        <style>
+          #tr_cmd_overlay{{position:fixed;inset:0;display:none;z-index:2147483000;background:rgba(0,0,0,.45);backdrop-filter:blur(6px);}}
+          #tr_cmd_modal{{max-width:740px;margin:8vh auto 0;padding:14px 14px;border-radius:18px;border:1px solid rgba(167,240,255,0.22);
+                        background:linear-gradient(180deg, rgba(255,255,255,0.10), rgba(255,255,255,0.04));
+                        box-shadow:0 22px 54px rgba(0,0,0,0.42), 0 0 46px rgba(167,240,255,0.10);}}
+          #tr_cmd_input{{width:100%;padding:12px 12px;border-radius:14px;border:1px solid rgba(167,240,255,0.18);
+                        background:rgba(0,0,0,0.18);color:rgba(236,243,255,0.92);outline:none;font-size:14px;letter-spacing:.03em;}}
+          #tr_cmd_list{{margin-top:10px;max-height:44vh;overflow:auto;}}
+          .tr_cmd_item{{padding:10px 10px;border-radius:14px;border:1px solid rgba(167,240,255,0.10);background:rgba(255,255,255,0.04);margin:8px 0;cursor:pointer;}}
+          .tr_cmd_item:hover{{border-color:rgba(167,240,255,0.22);box-shadow:0 0 26px rgba(167,240,255,0.10);}}
+          .tr_cmd_title{{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+                         letter-spacing:.10em;text-transform:uppercase;font-size:.75rem;color:rgba(236,243,255,0.86);}}
+          .tr_cmd_desc{{margin-top:3px;color:rgba(185,212,255,0.78);font-size:13px;}}
+          .tr_cmd_hint{{margin-top:10px;color:rgba(185,212,255,0.55);font-size:12px;letter-spacing:.08em;text-transform:uppercase;}}
+        </style>
+        <div id="tr_cmd_overlay">
+          <div id="tr_cmd_modal">
+            <input id="tr_cmd_input" placeholder="Type a command... (Enter to run)" />
+            <div id="tr_cmd_list"></div>
+            <div class="tr_cmd_hint">Ctrl+K to open • Esc to close • ↑/↓ to select</div>
+          </div>
+        </div>
+        <script>
+        (function(){{
+          const COMMANDS = {payload};
+          const overlay = document.getElementById('tr_cmd_overlay');
+          const input = document.getElementById('tr_cmd_input');
+          const list = document.getElementById('tr_cmd_list');
+          let idx = 0;
+
+          function score(q, t) {{
+            q = (q||'').toLowerCase().trim();
+            t = (t||'').toLowerCase();
+            if(!q) return 1;
+            if(t.includes(q)) return 100 - (t.indexOf(q));
+            // very small fuzzy
+            let qi=0;
+            for(let i=0;i<t.length && qi<q.length;i++) if(t[i]===q[qi]) qi++;
+            return qi===q.length ? 10 : 0;
+          }}
+
+          function render() {{
+            const q = input.value || '';
+            const items = COMMANDS.map(c => {{
+              const s = Math.max(score(q, c.title), score(q, c.desc));
+              return [s, c];
+            }}).filter(x => x[0] > 0).sort((a,b)=>b[0]-a[0]).slice(0, 16).map(x => x[1]);
+            if(idx >= items.length) idx = 0;
+            list.innerHTML = '';
+            items.forEach((c, i) => {{
+              const div = document.createElement('div');
+              div.className = 'tr_cmd_item';
+              div.style.opacity = (i===idx) ? '1.0' : '0.92';
+              div.style.borderColor = (i===idx) ? 'rgba(167,240,255,0.34)' : 'rgba(167,240,255,0.10)';
+              div.innerHTML = `<div class="tr_cmd_title">${{c.title}}</div><div class="tr_cmd_desc">${{c.desc||''}}</div>`;
+              div.onclick = () => run(c);
+              list.appendChild(div);
+            }});
+            overlay.dataset.items = JSON.stringify(items);
+          }}
+
+          function open() {{
+            overlay.style.display = 'block';
+            input.value = '';
+            idx = 0;
+            render();
+            setTimeout(()=>input.focus(), 10);
+          }}
+
+          function close() {{
+            overlay.style.display = 'none';
+          }}
+
+          function run(c) {{
+            try {{
+              const recent = JSON.parse(localStorage.getItem('tr_cmd_recent') || '[]');
+              recent.unshift(c.title);
+              const uniq = [...new Set(recent)].slice(0, 10);
+              localStorage.setItem('tr_cmd_recent', JSON.stringify(uniq));
+            }} catch(e) {{}}
+
+            const url = new URL(window.location.href);
+            url.searchParams.set('cmd', c.cmd);
+            if(c.arg) url.searchParams.set('arg', c.arg);
+            window.location.href = url.toString();
+          }}
+
+          document.addEventListener('keydown', (e) => {{
+            if((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {{
+              e.preventDefault();
+              open();
+            }}
+            if(overlay.style.display === 'block') {{
+              if(e.key === 'Escape') {{ e.preventDefault(); close(); }}
+              if(e.key === 'ArrowDown') {{ e.preventDefault(); idx++; render(); }}
+              if(e.key === 'ArrowUp') {{ e.preventDefault(); idx = Math.max(0, idx-1); render(); }}
+              if(e.key === 'Enter') {{
+                e.preventDefault();
+                const items = JSON.parse(overlay.dataset.items || '[]');
+                if(items.length) run(items[idx] || items[0]);
+              }}
+            }}
+          }});
+
+          overlay.addEventListener('mousedown', (e) => {{
+            if(e.target === overlay) close();
+          }});
+        }})();
+        </script>
+        """,
+        height=0,
+    )
 
 
 def _data_uri(path: Path) -> str | None:
@@ -293,9 +451,54 @@ if "last_outputs" not in st.session_state:
 if "hotfolder_proc" not in st.session_state:
     st.session_state.hotfolder_proc = None
 
+# Command palette (Ctrl+K)
+recent_files = []
+try:
+    recent_files = sorted((st.session_state.get("last_outputs") or {}).keys())[-8:]
+except Exception:
+    recent_files = []
+
+cmds: list[dict] = [
+    {"title": "Transcribe", "desc": "Run transcription for the current upload queue", "cmd": "transcribe"},
+    {"title": "Export brief", "desc": "Jump to Brief Pack for the selected file", "cmd": "brief"},
+    {"title": "Toggle redact", "desc": "Mask emails/phones in saved transcripts", "cmd": "toggle_redact"},
+    {"title": "Jump: low-confidence", "desc": "Filter segments to low-confidence only", "cmd": "low_conf"},
+]
+for i in range(1, 7):
+    cmds.append({"title": f"Jump: Speaker {i}", "desc": "Filter segments by speaker", "cmd": "speaker", "arg": f"Speaker {i}"})
+for f in recent_files:
+    cmds.append({"title": f"Select file: {f}", "desc": "Set Transcript view file selector", "cmd": "select_file", "arg": f})
+
+_command_palette(cmds)
+
+# Execute palette commands via query params (best-effort).
+cmd = _get_qp("cmd")
+arg = _get_qp("arg")
+if cmd:
+    try:
+        if cmd == "toggle_redact":
+            st.session_state["opt_redact"] = not bool(st.session_state.get("opt_redact", False))
+        elif cmd == "low_conf":
+            st.session_state["seg_low_only"] = True
+            st.session_state["seg_min_conf"] = 0.0
+            st.session_state["seg_low_threshold"] = 0.35
+        elif cmd == "speaker" and arg:
+            st.session_state["seg_speaker_filter"] = [str(arg)]
+        elif cmd == "select_file" and arg:
+            st.session_state["sel_file"] = str(arg)
+        elif cmd == "transcribe":
+            st.session_state["auto_transcribe"] = True
+        elif cmd == "brief":
+            st.session_state["focus_brief"] = True
+    except Exception:
+        pass
+    _clear_qp("cmd")
+    _clear_qp("arg")
+    st.rerun()
+
 with st.sidebar:
     st.header("Settings")
-    whisper_model = st.selectbox("Model", ["tiny", "base", "small", "medium", "large"], index=2)
+    whisper_model = st.selectbox("Model", ["tiny", "base", "small", "medium", "large"], index=2, key="opt_model")
     speakers_available = bool(importlib.util.find_spec("speechbrain") and importlib.util.find_spec("sklearn"))
     enable_speakers = st.checkbox(
         "Speaker labels (beta)",
@@ -315,6 +518,7 @@ with st.sidebar:
         value=2,
         step=1,
         disabled=(not enable_speakers) or (not speakers_available),
+        key="opt_speakers",
     )
 
     transcript_style = st.selectbox(
@@ -326,14 +530,34 @@ with st.sidebar:
         ],
         index=0,
         format_func=lambda x: x[0],
+        key="opt_style",
     )[1]
 
-    auto_clean = st.checkbox("Auto-clean audio", value=False, help="Applies safe defaults (VAD + normalize).")
-    vad = st.checkbox("VAD (trim silence)", value=bool(auto_clean), disabled=auto_clean)
-    normalize = st.checkbox("Normalize loudness", value=bool(auto_clean), disabled=auto_clean)
-    denoise = st.checkbox("Light denoise", value=False)
-    redact = st.checkbox("Redact emails/phones", value=False)
-    retain_audio = st.checkbox("Retain audio (playback verify)", value=True)
+    auto_clean = st.checkbox("Auto-clean audio", value=False, help="Applies safe defaults (VAD + normalize).", key="opt_autoclean")
+    vad = st.checkbox("VAD (trim silence)", value=bool(auto_clean), disabled=auto_clean, key="opt_vad")
+    normalize = st.checkbox("Normalize loudness", value=bool(auto_clean), disabled=auto_clean, key="opt_normalize")
+    denoise = st.checkbox("Light denoise", value=False, key="opt_denoise")
+    redact = st.checkbox("Redact emails/phones", value=False, key="opt_redact")
+    retain_audio = st.checkbox("Retain audio (playback verify)", value=True, key="opt_retain_audio")
+
+    lan_mode = st.checkbox("LAN mode (phone)", value=False, key="opt_lan_mode")
+    if lan_mode:
+        ip = _get_local_ip()
+        if ip:
+            url = f"http://{ip}:8501"
+            st.caption(f"Start with `Launch-LAN.cmd`, then open: `{url}`")
+            try:
+                import qrcode
+
+                qr = qrcode.QRCode(border=1, box_size=6)
+                qr.add_data(url)
+                qr.make(fit=True)
+                img = qr.make_image(fill_color="#A7F0FF", back_color="#071C34")
+                st.image(img, caption="Scan to open on your phone", use_container_width=True)
+            except Exception:
+                st.caption("Install QR support: `python -m pip install -r requirements.txt`.")
+        else:
+            st.caption("Could not detect local IP. Use `ipconfig` and open `http://<ip>:8501`.")
 
     with st.expander("Advanced"):
         language = st.text_input("Language", value="en")
@@ -418,6 +642,10 @@ with tabs[0]:
     )
 
     start = st.button("Transcribe", type="primary", use_container_width=True)
+    if st.session_state.get("auto_transcribe"):
+        start = True
+        st.session_state["auto_transcribe"] = False
+
     if not start:
         st.caption("Press Transcribe when ready.")
         st.stop()
@@ -742,13 +970,13 @@ with tabs[2]:
         st.stop()
 
     files = sorted(transcripts.keys())
-    selected = st.selectbox("File", files, index=0)
+    selected = st.selectbox("File", files, index=0, key="sel_file")
 
     text = transcripts.get(selected, "")
     briefs: dict[str, dict[str, str]] = st.session_state.get("last_briefs") or {}
     segs = (outputs.get(selected) or {}).get("segments") or []
     stem = (outputs.get(selected) or {}).get("stem")
-    query = st.text_input("Search", value="", placeholder="Search segments...")
+    query = st.text_input("Search", value="", placeholder="Search segments...", key="seg_query")
 
     # Playback sync (best-effort).
     zip_bytes = st.session_state.get("last_zip_bytes")
@@ -846,19 +1074,26 @@ with tabs[2]:
         # Filters
         speakers = sorted({str((s.get("speaker") or "").strip() or "Speaker") for s in segs})
         cols = st.columns([2, 2, 2])
-        speaker_filter = cols[0].multiselect("Speaker", options=speakers, default=speakers)
-        min_conf = cols[1].slider("Min confidence", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
-        show_low_only = cols[2].checkbox("Low-confidence only", value=False)
+        speaker_filter = cols[0].multiselect("Speaker", options=speakers, default=speakers, key="seg_speaker_filter")
+        min_conf = cols[1].slider("Min confidence", min_value=0.0, max_value=1.0, value=0.0, step=0.05, key="seg_min_conf")
+        show_low_only = cols[2].checkbox("Low-confidence only", value=False, key="seg_low_only")
 
         cols2 = st.columns(3)
-        want_digits = cols2[0].checkbox("Contains digits", value=False)
-        want_questions = cols2[1].checkbox("Questions", value=False)
-        want_caps = cols2[2].checkbox("Capitalized names", value=False)
+        want_digits = cols2[0].checkbox("Contains digits", value=False, key="seg_digits")
+        want_questions = cols2[1].checkbox("Questions", value=False, key="seg_questions")
+        want_caps = cols2[2].checkbox("Capitalized names", value=False, key="seg_caps")
 
         # If low-only is enabled, treat as "below threshold" gate.
         low_threshold = 0.35
         if show_low_only:
-            low_threshold = st.slider("Low-confidence threshold", min_value=0.05, max_value=0.75, value=0.35, step=0.05)
+            low_threshold = st.slider(
+                "Low-confidence threshold",
+                min_value=0.05,
+                max_value=0.75,
+                value=0.35,
+                step=0.05,
+                key="seg_low_threshold",
+            )
 
         shown = 0
         blocks: list[str] = []
@@ -953,6 +1188,12 @@ with tabs[2]:
 
     brief = briefs.get(selected)
     if brief:
+        if st.session_state.get("focus_brief"):
+            st.session_state["focus_brief"] = False
+            try:
+                st.toast("Brief Pack ready.", icon=None)
+            except Exception:
+                pass
         st.markdown(
             """
             <div class="hud" style="padding:10px 12px; margin-top: 10px;">
