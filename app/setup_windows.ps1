@@ -7,6 +7,12 @@ Set-Location $ProjectRoot
 
 Write-Info "Project: $ProjectRoot"
 
+function Set-HiddenFolder($path) {
+  if (-not (Test-Path $path)) { return }
+  $item = Get-Item -LiteralPath $path -Force
+  $item.Attributes = $item.Attributes -bor [System.IO.FileAttributes]::Hidden
+}
+
 function Test-FFmpegAvailable {
   $ffmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue
   $ffprobe = Get-Command ffprobe -ErrorAction SilentlyContinue
@@ -116,11 +122,13 @@ function Ensure-BundledFFmpeg {
 }
 
 Ensure-BundledFFmpeg
+Set-HiddenFolder (Join-Path $ProjectRoot "tools")
 
 if (-not (Test-Path ".\\.venv\\Scripts\\python.exe")) {
   Write-Info "Creating venv..."
   py -m venv .venv
 }
+Set-HiddenFolder (Join-Path $ProjectRoot ".venv")
 
 Write-Info "Installing Python deps..."
 & ".\\.venv\\Scripts\\python.exe" -m pip install -U pip | Out-Host
@@ -137,7 +145,12 @@ $WshShell = New-Object -ComObject WScript.Shell
 $Desktop = [Environment]::GetFolderPath("Desktop")
 $ShortcutPath = Join-Path $Desktop "TRANSCRIBER.lnk"
 $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
-$Shortcut.TargetPath = (Join-Path $ProjectRoot "Launch.cmd")
+$RootLauncher = Join-Path (Split-Path -Parent $ProjectRoot) "RUNME - Start TRANSCRIBER.cmd"
+if (Test-Path $RootLauncher) {
+  $Shortcut.TargetPath = $RootLauncher
+} else {
+  $Shortcut.TargetPath = (Join-Path $ProjectRoot "Launch.cmd")
+}
 $Shortcut.Arguments = ""
 $Shortcut.WorkingDirectory = $ProjectRoot
 $Shortcut.IconLocation = (Resolve-Path ".\\assets\\mp3_transcriber.ico").Path

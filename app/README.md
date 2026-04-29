@@ -1,0 +1,86 @@
+# TRANSCRIBER
+
+TRANSCRIBER is a local Windows-friendly app for turning audio and video files into transcripts. It runs Whisper on your computer, so your files are not uploaded to a cloud transcription service.
+
+## For Normal Use
+
+If you are looking at the simple release folder, double-click `RUNME - Start TRANSCRIBER.cmd`.
+
+If you have a release ZIP, unzip it somewhere permanent such as Documents or Desktop, then:
+
+1. Double-click `1 Install TRANSCRIBER.cmd` once.
+2. Double-click `2 Start TRANSCRIBER.cmd` or the Desktop shortcut named `TRANSCRIBER`.
+
+If you are running from the source project folder instead:
+
+1. Double-click `Setup.cmd` once.
+2. After setup finishes, double-click the Desktop shortcut named `TRANSCRIBER`.
+3. Drop in audio files and download the transcript ZIP when it finishes.
+
+For phone or tablet access on the same Wi-Fi, launch with `Launch-LAN.cmd` and use the QR code shown inside the app.
+
+If you only want the shortest possible instructions, open `START_HERE.md`.
+
+## What It Produces
+
+Each transcript bundle can include:
+
+- `transcript.txt` with timestamps and optional speaker labels
+- `transcript_plain.txt` with clean plain text
+- `segments.json` with timestamped transcript data
+- `transcript.srt` and `transcript.vtt` subtitle files
+- `brief.md` and `brief.html` with a one-page brief pack
+
+Supported inputs include `.mp3`, `.m4a`, `.mp4`, `.aac`, `.wav`, `.flac`, `.ogg`, `.m4b`, and `.webm`.
+
+## Optional Features
+
+Speaker labels are beta. On Windows, run `Setup-Speakers.cmd` after `Setup.cmd`, then relaunch the app.
+
+Hot-folder watching is available from the app. If the app says the watcher dependency is missing, install it with:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-hotfolder.txt
+```
+
+## Manual Run
+
+Use this if you are developing the project or running it outside the Windows launchers.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -U pip
+python -m pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+On macOS/Linux, install FFmpeg first, then use `setup_unix.sh` or create a virtual environment manually.
+
+## Command Line
+
+Transcribe one file:
+
+```powershell
+python transcribe_cli.py --input "C:\path\to\audio.m4a" --out ".\out"
+```
+
+Transcribe a folder:
+
+```powershell
+python transcribe_cli.py --input "C:\path\to\audio-folder" --out ".\out"
+```
+
+## Folder Map
+
+See `docs\PROJECT_STRUCTURE.md` for a plain-English explanation of what each folder/file is for.
+
+## Building A Windows Release ZIP
+
+From the project folder:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package_windows.ps1 -Version 0.1.0
+```
+
+The output appears in `dist\TRANSCRIBER-Windows-0.1.0.zip`.
