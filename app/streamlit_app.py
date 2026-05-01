@@ -109,9 +109,7 @@ def _safe_uploaded_filename(name: str, *, index: int) -> str:
 
     stem = Path(raw_name).stem.strip().replace(" ", "_")
     stem = "".join(ch for ch in stem if ch.isalnum() or ch in ("_", "-", "."))
-    while ".." in stem:
-        stem = stem.replace("..", ".")
-    stem = stem.lstrip(".")
+    stem = ".".join(part for part in stem.split(".") if part)
     if not stem:
         stem = f"upload_{index:02d}"
     return f"{index:02d}_{stem}{suffix}"
