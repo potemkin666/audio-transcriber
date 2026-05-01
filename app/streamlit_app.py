@@ -286,6 +286,23 @@ def _load_saved_outputs_from_dir(root: Path) -> tuple[dict[str, str], dict[str, 
     return _collect_saved_outputs(rows, zip_bytes=_zip_dir(root))
 
 
+def _validated_saved_output_dir(path_text: str) -> Path:
+    raw = str(path_text or "").strip()
+    if not raw:
+        raise RuntimeError("Choose a transcript ZIP or an output folder first.")
+    if any(ch in raw for ch in ("\x00", "\n", "\r")):
+        raise RuntimeError("Folder path contains unsupported characters.")
+
+    resolved = Path(raw).expanduser().resolve(strict=True)
+    if not resolved.is_dir():
+        raise FileNotFoundError(f"Saved output folder not found: {resolved}")
+
+    allowed_roots = [Path.home().resolve(), Path.cwd().resolve()]
+    if not any(resolved == root or root in resolved.parents for root in allowed_roots):
+        raise RuntimeError("Choose a saved output folder under your home directory or the current workspace.")
+    return resolved
+
+
 def _command_palette(commands: list[dict]) -> None:
     payload = json.dumps(commands)
     components.html(
@@ -1193,9 +1210,7 @@ with tabs[2]:
             if load_zip is not None:
                 transcripts, briefs, outputs, zip_bytes = _load_saved_outputs_from_zip_bytes(load_zip.getvalue())
             elif load_folder.strip():
-                load_root = Path(load_folder).expanduser()
-                if not load_root.exists() or not load_root.is_dir():
-                    raise FileNotFoundError(f"Saved output folder not found: {load_root}")
+                load_root = _validated_saved_output_dir(load_folder)
                 transcripts, briefs, outputs, zip_bytes = _load_saved_outputs_from_dir(load_root)
             else:
                 raise RuntimeError("Choose a transcript ZIP or an output folder first.")
