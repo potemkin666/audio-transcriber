@@ -128,7 +128,7 @@ def _dedupe_preserve_order(values: list[str]) -> list[str]:
     return result
 
 
-def _build_output_meta(*, preflight: dict | None = None, run_stats: dict | None = None) -> dict:
+def _build_output_meta(*, preflight: dict | None = None, run_stats: dict | None = None, diarization: dict | None = None) -> dict:
     preflight_warnings = []
     if isinstance(preflight, dict):
         preflight_warnings = [str(w).strip() for w in (preflight.get("warnings") or []) if str(w).strip()]
@@ -161,6 +161,7 @@ def _build_output_meta(*, preflight: dict | None = None, run_stats: dict | None 
     return {
         "preflight": preflight if isinstance(preflight, dict) else {},
         "run_stats": run_stats if isinstance(run_stats, dict) else {},
+        "diarization": diarization if isinstance(diarization, dict) else {},
         "warnings": warnings,
         "warning_summary": warning_summary,
         "skipped_total": skipped_total,
@@ -173,9 +174,11 @@ def _build_output_meta(*, preflight: dict | None = None, run_stats: dict | None 
 def _load_output_meta(output_dir: Path) -> dict:
     preflight = _read_json_file(output_dir / "preflight.json")
     run_stats = _read_json_file(output_dir / "run_stats.json")
+    diarization = _read_json_file(output_dir / "diarization.json")
     return _build_output_meta(
         preflight=preflight if isinstance(preflight, dict) else None,
         run_stats=run_stats if isinstance(run_stats, dict) else None,
+        diarization=diarization if isinstance(diarization, dict) else None,
     )
 
 
@@ -204,6 +207,7 @@ def _collect_saved_outputs(rows: list[dict], *, zip_bytes: bytes | None = None) 
         meta = _build_output_meta(
             preflight=row.get("preflight") if isinstance(row.get("preflight"), dict) else None,
             run_stats=run_stats if isinstance(run_stats, dict) else None,
+            diarization=row.get("diarization") if isinstance(row.get("diarization"), dict) else None,
         )
         transcripts[display_name] = transcript_text
         if isinstance(row.get("brief"), dict):
@@ -251,6 +255,7 @@ def _load_saved_outputs_from_zip_bytes(zip_bytes: bytes) -> tuple[dict[str, str]
                     "brief": _read_json(f"{stem}/brief_snippets.json"),
                     "preflight": _read_json(f"{stem}/preflight.json"),
                     "run_stats": _read_json(f"{stem}/run_stats.json"),
+                    "diarization": _read_json(f"{stem}/diarization.json"),
                 }
             )
     return _collect_saved_outputs(rows, zip_bytes=zip_bytes)
@@ -275,6 +280,7 @@ def _load_saved_outputs_from_dir(root: Path) -> tuple[dict[str, str], dict[str, 
                 "brief": _read_json_file(output_dir / "brief_snippets.json"),
                 "preflight": _read_json_file(output_dir / "preflight.json"),
                 "run_stats": _read_json_file(output_dir / "run_stats.json"),
+                "diarization": _read_json_file(output_dir / "diarization.json"),
             }
         )
     return _collect_saved_outputs(rows, zip_bytes=_zip_dir(root))
@@ -295,6 +301,33 @@ def _validated_saved_output_dir(path_text: str) -> Path:
     if not any(resolved == root or root in resolved.parents for root in allowed_roots):
         raise RuntimeError("Choose a saved output folder under your home directory or the current workspace.")
     return resolved
+
+
+def _speaker_confidence_badge(value: float | None) -> tuple[str, str, str]:
+    if value is None:
+        return (
+            "Speaker match: n/a",
+            "mid",
+            "Speaker-label confidence is unavailable for this segment.",
+        )
+    score = max(0.0, min(1.0, float(value)))
+    if score >= 0.75:
+        level = "High"
+        css = "good"
+    elif score >= 0.45:
+        level = "Medium"
+        css = "mid"
+    else:
+        level = "Low"
+        css = "low"
+    return (
+        f"Speaker match: {level}",
+        css,
+        (
+            "Heuristic speaker-label confidence derived from distance to the assigned "
+            f"KMeans centroid. Raw score: {score:.2f}."
+        ),
+    )
 
 
 def _command_palette(commands: list[dict]) -> None:
@@ -716,6 +749,11 @@ with st.sidebar:
         disabled=(not enable_speakers) or (not speakers_available),
         key="opt_speakers",
     )
+    if enable_speakers and speakers_available:
+        st.caption(
+            "Speaker labels are optional diarization, not identity tracking. Pick the count if you know it; "
+            "otherwise start at 2 and review diarization metrics in Transcript → Diagnostics."
+        )
 
     transcript_style = st.selectbox(
         "Output style",
@@ -1249,6 +1287,7 @@ with tabs[2]:
                     "skipped_summary": output_meta.get("skipped_summary"),
                     "preflight": output_meta.get("preflight") or {},
                     "run_stats": output_meta.get("run_stats") or {},
+                    "diarization": output_meta.get("diarization") or {},
                 }
             )
         if warnings or skipped_total:
@@ -1351,6 +1390,27 @@ with tabs[2]:
             unsafe_allow_html=True,
         )
         st.caption("Confidence is estimated from Whisper metadata (avg_logprob, no_speech_prob, compression_ratio).")
+        diarization_meta = output_meta.get("diarization") or {}
+        diarization_metrics = diarization_meta.get("metrics") if isinstance(diarization_meta, dict) else {}
+        diarization_parts: list[str] = []
+        if isinstance(diarization_meta, dict):
+            diar_count = diarization_meta.get("num_speakers")
+            if diar_count:
+                diarization_parts.append(f"configured speakers: {int(diar_count)}")
+        if isinstance(diarization_metrics, dict):
+            if diarization_metrics.get("n_windows") is not None:
+                diarization_parts.append(f"windows: {int(diarization_metrics.get('n_windows') or 0)}")
+            if diarization_metrics.get("silhouette") is not None:
+                diarization_parts.append(f"silhouette: {float(diarization_metrics.get('silhouette') or 0.0):.2f}")
+            if diarization_metrics.get("inertia") is not None:
+                diarization_parts.append(f"inertia: {float(diarization_metrics.get('inertia') or 0.0):.2f}")
+        if diarization_parts:
+            st.caption(
+                "Speaker labels use optional KMeans-based diarization. "
+                + " • ".join(diarization_parts)
+                + "."
+            )
+        st.caption("Speaker match badges are heuristic: High ≥ 0.75, Medium ≥ 0.45, Low < 0.45.")
 
         def _conf_score(s: dict) -> float:
             w = s.get("whisper") or {}
@@ -1436,17 +1496,21 @@ with tabs[2]:
                 conf_label = "Stronger match"
 
             spk_conf = s.get("speaker_confidence")
-            spk_conf_txt = ""
+            spk_badge_html = ""
             try:
                 if spk_conf is not None:
-                    spk_conf_txt = f" • spk {float(spk_conf):.2f}"
+                    spk_label, spk_css, spk_title = _speaker_confidence_badge(float(spk_conf))
+                    spk_badge_html = (
+                        f' <span class="conf-chip {spk_css}" title="{_html.escape(spk_title)}">'
+                        f'<span class="dot"></span>{_html.escape(spk_label)}</span>'
+                    )
             except Exception:
-                spk_conf_txt = ""
+                spk_badge_html = ""
 
             blocks.append(
                 f"""
                 <div class="seg {cls}" onclick="window.__transcriber_jump && window.__transcriber_jump({start:.3f});">
-                  <div class="seg-h">{_html.escape(_format_duration(start))} <span class="spk">{_html.escape(spk)}</span> <span class="conf-chip {cls}"><span class="dot"></span>{_html.escape(conf_label)}</span> <span class="sc">{sc:.2f}{_html.escape(spk_conf_txt)}</span></div>
+                  <div class="seg-h">{_html.escape(_format_duration(start))} <span class="spk">{_html.escape(spk)}</span> <span class="conf-chip {cls}"><span class="dot"></span>{_html.escape(conf_label)}</span>{spk_badge_html} <span class="sc">{sc:.2f}</span></div>
                   <div class="seg-t">{_html.escape(txt)}</div>
                 </div>
                 """

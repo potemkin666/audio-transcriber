@@ -229,6 +229,16 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(safe_name("../unsafe name.mp3", index=1), "upload_01.mp3")
         self.assertEqual(safe_name("odd.ext", index=2), "upload_02.wav")
 
+        speaker_badge = globals_dict["_speaker_confidence_badge"]
+        self.assertEqual(speaker_badge(0.9)[0], "Speaker match: High")
+        self.assertEqual(speaker_badge(0.5)[0], "Speaker match: Medium")
+        self.assertEqual(speaker_badge(0.2)[0], "Speaker match: Low")
+
+        build_output_meta = globals_dict["_build_output_meta"]
+        meta = build_output_meta(diarization={"num_speakers": 2, "metrics": {"silhouette": 0.61}})
+        self.assertEqual(meta["diarization"]["num_speakers"], 2)
+        self.assertEqual(meta["diarization"]["metrics"]["silhouette"], 0.61)
+
 
 if __name__ == "__main__":
     unittest.main()

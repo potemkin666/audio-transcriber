@@ -48,12 +48,29 @@ Supported inputs include `.mp3`, `.m4a`, `.mp4`, `.aac`, `.wav`, `.flac`, `.ogg`
 ## Optional Features
 
 Speaker labels are beta. On Windows, run `Setup-Speakers.cmd` after `Setup.cmd`, then relaunch the app.
+They are implemented as optional speaker diarization with speech embeddings plus KMeans-based labeling. This is not an identity graph, entity stitching, or person-recognition system.
 
 Hot-folder watching is available from the app. If the app says the watcher dependency is missing, install it with:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-hotfolder.txt
 ```
+
+## Privacy and local telemetry
+
+TRANSCRIBER stores a small local telemetry file only to improve ETA estimates on your own machine.
+
+- Windows: `%LOCALAPPDATA%\transcriber\telemetry.json`
+- macOS / Linux: `~/.cache/transcriber/telemetry.json`
+
+The file stores only per-configuration speed profiles:
+
+- model name
+- whether speaker labeling was enabled
+- learned real-time factor (`rtf`)
+- sample count used for the moving average
+
+It does **not** store transcript text, audio, speaker names, identities, or remote analytics. The file stays on the local machine unless you copy it yourself.
 
 ## Install from source
 

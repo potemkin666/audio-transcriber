@@ -19,3 +19,11 @@ Please do **not** open a public GitHub issue for suspected vulnerabilities.
 
 - Please allow time for triage, remediation, and release planning before public disclosure.
 - We will acknowledge receipt, investigate, and coordinate on a fix and disclosure timeline.
+
+## Local telemetry and privacy notes
+
+- TRANSCRIBER stores a local telemetry file for ETA learning only.
+- Windows path: `%LOCALAPPDATA%\transcriber\telemetry.json`
+- macOS / Linux path: `~/.cache/transcriber/telemetry.json`
+- Stored fields are limited to model name, whether speaker diarization was enabled, learned real-time factor (`rtf`), and sample count.
+- The project does not use this file for remote analytics, account tracking, or identity graphs.
