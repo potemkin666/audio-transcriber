@@ -1,6 +1,18 @@
 # TRANSCRIBER
 
-TRANSCRIBER is a local Windows-friendly app for turning audio and video files into transcripts. It runs Whisper on your computer, so your files are not uploaded to a cloud transcription service.
+TRANSCRIBER is a local app for turning audio and video files into transcripts. It runs Whisper on your computer, so your files are not uploaded to a cloud transcription service.
+
+No environment variables are required for standard local use.
+
+## Supported platforms
+
+- Windows 10/11
+- macOS
+- Linux
+
+## UI preview
+
+![TRANSCRIBER UI preview](assets/mp3_transcriber.png)
 
 ## For Normal Use
 
@@ -43,9 +55,75 @@ Hot-folder watching is available from the app. If the app says the watcher depen
 .\.venv\Scripts\python.exe -m pip install -r requirements-hotfolder.txt
 ```
 
+## Install from source
+
+### Windows
+
+Prerequisites:
+
+- Python 3
+
+Run from `/home/runner/work/audio-transcriber/audio-transcriber/app`:
+
+```powershell
+.\Setup.cmd
+.\Launch.cmd
+```
+
+Optional LAN launch:
+
+```powershell
+.\Launch-LAN.cmd
+```
+
+### macOS
+
+Prerequisites:
+
+```bash
+brew install python ffmpeg
+```
+
+Run from `/home/runner/work/audio-transcriber/audio-transcriber/app`:
+
+```bash
+bash ./setup_unix.sh
+```
+
+### Ubuntu / Debian Linux
+
+Prerequisites:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv ffmpeg
+```
+
+Run from `/home/runner/work/audio-transcriber/audio-transcriber/app`:
+
+```bash
+bash ./setup_unix.sh
+```
+
+If `setup_unix.sh` stops with an error, fix the missing prerequisite shown in the terminal and rerun the same command.
+
+First successful run confirmation on macOS/Linux:
+
+```bash
+curl -s http://127.0.0.1:8501/_stcore/health
+```
+
+Expected output:
+
+```text
+ok
+```
+
 ## Manual Run
 
 Use this if you are developing the project or running it outside the Windows launchers.
+
+### Windows PowerShell
 
 ```powershell
 python -m venv .venv
@@ -55,7 +133,17 @@ python -m pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-On macOS/Linux, install FFmpeg first, then use `setup_unix.sh` or create a virtual environment manually.
+### macOS / Linux
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+Install FFmpeg before the first run.
 
 ## Command Line
 
