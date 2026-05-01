@@ -19,7 +19,7 @@ import streamlit.components.v1 as components
 
 from transcriber.core import TranscriptionOptions, prepare_whisper_model, transcribe_file
 from transcriber.ffmpeg import ensure_ffmpeg_available, probe_duration_seconds, ffmpeg_version_line, ffprobe_version_line, find_ffmpeg_tools
-from transcriber.hotfolder import FileSignature, iter_audio_files, load_state, rel_key, save_state, sha256_file, stat_signature
+from transcriber.hotfolder import decide_file_action, iter_audio_files, load_state, rel_key, save_state
 from transcriber.telemetry import get_rtf
 
 
@@ -134,10 +134,7 @@ def _dedupe_preserve_order(values: list[str]) -> list[str]:
     return result
 
 
-def _load_output_meta(output_dir: Path) -> dict:
-    preflight = _read_json_file(output_dir / "preflight.json")
-    run_stats = _read_json_file(output_dir / "run_stats.json")
-
+def _build_output_meta(*, preflight: dict | None = None, run_stats: dict | None = None) -> dict:
     preflight_warnings = []
     if isinstance(preflight, dict):
         preflight_warnings = [str(w).strip() for w in (preflight.get("warnings") or []) if str(w).strip()]
@@ -177,6 +174,116 @@ def _load_output_meta(output_dir: Path) -> dict:
         "skipped_quiet": skipped_quiet,
         "skipped_summary": skipped_summary,
     }
+
+
+def _load_output_meta(output_dir: Path) -> dict:
+    preflight = _read_json_file(output_dir / "preflight.json")
+    run_stats = _read_json_file(output_dir / "run_stats.json")
+    return _build_output_meta(
+        preflight=preflight if isinstance(preflight, dict) else None,
+        run_stats=run_stats if isinstance(run_stats, dict) else None,
+    )
+
+
+def _unique_output_name(name: str, existing: dict[str, str]) -> str:
+    base = str(name or "").strip() or "Transcript"
+    if base not in existing:
+        return base
+    idx = 2
+    while f"{base} ({idx})" in existing:
+        idx += 1
+    return f"{base} ({idx})"
+
+
+def _collect_saved_outputs(rows: list[dict], *, zip_bytes: bytes | None = None) -> tuple[dict[str, str], dict[str, dict], dict[str, dict], bytes | None]:
+    transcripts: dict[str, str] = {}
+    briefs: dict[str, dict] = {}
+    outputs: dict[str, dict] = {}
+    for row in rows:
+        transcript_text = str(row.get("transcript") or "")
+        if not transcript_text.strip():
+            continue
+        stem = str(row.get("stem") or "").strip()
+        run_stats = row.get("run_stats") if isinstance(row.get("run_stats"), dict) else {}
+        input_name = str(run_stats.get("input_name") or row.get("display_name") or stem or "Transcript")
+        display_name = _unique_output_name(input_name, transcripts)
+        meta = _build_output_meta(
+            preflight=row.get("preflight") if isinstance(row.get("preflight"), dict) else None,
+            run_stats=run_stats if isinstance(run_stats, dict) else None,
+        )
+        transcripts[display_name] = transcript_text
+        if isinstance(row.get("brief"), dict):
+            briefs[display_name] = row["brief"]
+        outputs[display_name] = {
+            "stem": stem,
+            "segments": row.get("segments") if isinstance(row.get("segments"), list) else None,
+            "meta": meta,
+        }
+    return transcripts, briefs, outputs, zip_bytes
+
+
+def _load_saved_outputs_from_zip_bytes(zip_bytes: bytes) -> tuple[dict[str, str], dict[str, dict], dict[str, dict], bytes | None]:
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), mode="r") as zf:
+        stems = sorted(
+            {
+                Path(name).parts[0]
+                for name in zf.namelist()
+                if name and not name.endswith("/") and len(Path(name).parts) > 1
+            }
+        )
+        rows: list[dict] = []
+        for stem in stems:
+            def _read_text(member: str) -> str | None:
+                try:
+                    return zf.read(member).decode("utf-8", errors="replace")
+                except Exception:
+                    return None
+
+            def _read_json(member: str) -> dict | list | None:
+                try:
+                    return json.loads(zf.read(member).decode("utf-8"))
+                except Exception:
+                    return None
+
+            transcript = _read_text(f"{stem}/transcript.txt")
+            if not transcript:
+                continue
+            rows.append(
+                {
+                    "stem": stem,
+                    "display_name": stem,
+                    "transcript": transcript,
+                    "segments": _read_json(f"{stem}/segments.json"),
+                    "brief": _read_json(f"{stem}/brief_snippets.json"),
+                    "preflight": _read_json(f"{stem}/preflight.json"),
+                    "run_stats": _read_json(f"{stem}/run_stats.json"),
+                }
+            )
+    return _collect_saved_outputs(rows, zip_bytes=zip_bytes)
+
+
+def _load_saved_outputs_from_dir(root: Path) -> tuple[dict[str, str], dict[str, dict], dict[str, dict], bytes | None]:
+    rows: list[dict] = []
+    for output_dir in sorted([p for p in root.iterdir() if p.is_dir()]):
+        transcript_path = output_dir / "transcript.txt"
+        if not transcript_path.exists():
+            continue
+        try:
+            transcript = transcript_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        rows.append(
+            {
+                "stem": output_dir.name,
+                "display_name": output_dir.name,
+                "transcript": transcript,
+                "segments": _read_json_file(output_dir / "segments.json"),
+                "brief": _read_json_file(output_dir / "brief_snippets.json"),
+                "preflight": _read_json_file(output_dir / "preflight.json"),
+                "run_stats": _read_json_file(output_dir / "run_stats.json"),
+            }
+        )
+    return _collect_saved_outputs(rows, zip_bytes=_zip_dir(root))
 
 
 def _command_palette(commands: list[dict]) -> None:
@@ -314,7 +421,7 @@ def _data_uri(path: Path) -> str | None:
     return f"data:{mime};base64,{b64}"
 
 
-def _apply_cyberlife_ui(*, water_uri: str | None, overlay_uri: str | None) -> None:
+def _apply_transcriber_ui(*, water_uri: str | None, overlay_uri: str | None) -> None:
     water_css = f"background-image: url('{water_uri}');" if water_uri else ""
     overlay_css = f"background-image: url('{overlay_uri}');" if overlay_uri else ""
 
@@ -327,20 +434,19 @@ def _apply_cyberlife_ui(*, water_uri: str | None, overlay_uri: str | None) -> No
         --muted:#B9D4FF;
         --blue:#4BB4FF;
         --cyan:#A7F0FF;
-        --line: rgba(75,180,255,0.40);
-        --line2: rgba(167,240,255,0.28);
-        --glass: rgba(255,255,255,0.10);
+        --line: rgba(75,180,255,0.24);
+        --line2: rgba(167,240,255,0.18);
+        --glass: rgba(255,255,255,0.06);
       }
 
       html, body, [data-testid="stAppViewContainer"]{
         background:
-          radial-gradient(1200px 760px at 70% 10%, rgba(75,180,255,0.42), transparent 58%),
-          radial-gradient(980px 600px at 25% 45%, rgba(167,240,255,0.24), transparent 62%),
+          radial-gradient(1200px 760px at 70% 10%, rgba(75,180,255,0.24), transparent 58%),
+          radial-gradient(980px 600px at 25% 45%, rgba(167,240,255,0.14), transparent 62%),
           linear-gradient(180deg, var(--bg0), var(--bg1));
         color: var(--ink);
       }
 
-      /* Water texture overlay */
       [data-testid="stAppViewContainer"]::before{
         content:"";
         position: fixed;
@@ -348,39 +454,25 @@ def _apply_cyberlife_ui(*, water_uri: str | None, overlay_uri: str | None) -> No
         __WATER_CSS__
         background-size: cover;
         background-position: center;
-        opacity: 0.46;
-        filter: saturate(1.45) contrast(1.10) brightness(1.18);
-        animation: driftA 22s ease-in-out infinite alternate;
+        opacity: 0.10;
+        filter: saturate(1.0) contrast(1.0) brightness(1.02);
         pointer-events: none;
         z-index: 0;
       }
 
-      /* Bright overlay shards */
       [data-testid="stAppViewContainer"]::after{
         content:"";
         position: fixed;
-        inset: -10%;
+        inset: 0;
         __OVERLAY_CSS__
         background-size: cover;
         background-position: center;
-        opacity: 0.30;
-        filter: saturate(1.45) contrast(1.18) brightness(1.20) blur(0.25px);
-        mix-blend-mode: screen;
-        animation: driftB 28s ease-in-out infinite alternate;
+        opacity: 0.04;
+        filter: saturate(0.9) contrast(1.0) brightness(1.0);
         pointer-events: none;
         z-index: 0;
       }
 
-      @keyframes driftA {
-        0%   { transform: translate3d(0px, 0px, 0px) scale(1.02); }
-        100% { transform: translate3d(-10px, 14px, 0px) scale(1.05); }
-      }
-      @keyframes driftB {
-        0%   { transform: translate3d(0px, 0px, 0px) scale(1.03); }
-        100% { transform: translate3d(16px, -12px, 0px) scale(1.06); }
-      }
-
-      /* Lift app above overlay */
       [data-testid="stAppViewContainer"] > .main {
         position: relative;
         z-index: 1;
@@ -388,83 +480,53 @@ def _apply_cyberlife_ui(*, water_uri: str | None, overlay_uri: str | None) -> No
 
       [data-testid="stHeader"]{ background: transparent; }
       [data-testid="stSidebar"]{
-        background: rgba(255,255,255,0.06);
-        border-right: 1px solid rgba(167,240,255,0.25);
-        backdrop-filter: blur(10px);
+        background: rgba(6, 18, 33, 0.72);
+        border-right: 1px solid rgba(167,240,255,0.16);
       }
 
       .block-container{ padding-top: 1.0rem; }
 
       h1, h2, h3{
-        letter-spacing: 0.06em;
-        text-transform: uppercase;
+        letter-spacing: 0.01em;
+        text-transform: none;
       }
 
-      /* Buttons */
       button[kind="primary"]{
-        background: linear-gradient(90deg, rgba(167,240,255,0.95), rgba(75,180,255,0.95)) !important;
+        background: linear-gradient(180deg, rgba(167,240,255,0.94), rgba(113,200,255,0.94)) !important;
         color: #03101F !important;
         border: 0 !important;
-        letter-spacing: 0.03em;
-        text-transform: uppercase;
-        box-shadow:
-          0 0 0 1px rgba(167,240,255,0.25),
-          0 12px 30px rgba(75,180,255,0.28),
-          0 0 30px rgba(167,240,255,0.18) !important;
+        letter-spacing: 0.01em;
+        text-transform: none;
+        box-shadow: 0 10px 22px rgba(6, 18, 33, 0.22) !important;
       }
 
-      /* Progress */
       div[data-testid="stProgress"] > div{ background: rgba(75,180,255,0.22); }
       div[data-testid="stProgress"] div[role="progressbar"]{
         background: linear-gradient(90deg, var(--blue), var(--cyan));
-        box-shadow: 0 0 22px rgba(167,240,255,0.25);
+        box-shadow: none;
       }
 
-      /* Alerts */
       [data-testid="stAlert"]{
-        background: rgba(255,255,255,0.08);
-        border: 1px solid rgba(167,240,255,0.24);
+        background: rgba(255,255,255,0.05);
+        border: 1px solid rgba(167,240,255,0.18);
       }
 
-      /* HUD */
       .hud{
-        border: 1px solid rgba(167,240,255,0.26);
-        border-radius: 18px;
+        border: 1px solid rgba(167,240,255,0.18);
+        border-radius: 16px;
         padding: 14px 16px;
-        background: linear-gradient(180deg, rgba(255,255,255,0.12), rgba(255,255,255,0.05));
+        background: linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03));
         position: relative;
         overflow: hidden;
-        box-shadow:
-          0 0 0 1px rgba(167,240,255,0.20),
-          0 22px 54px rgba(0,0,0,0.35),
-          0 0 46px rgba(167,240,255,0.12);
-        backdrop-filter: blur(10px);
-      }
-
-      .hud:before{
-        content:"";
-        position:absolute;
-        left:-20%; top:-50%;
-        width: 140%; height: 200%;
-        background: repeating-linear-gradient(
-          0deg,
-          rgba(66,165,255,0.00),
-          rgba(66,165,255,0.00) 8px,
-          rgba(66,165,255,0.06) 9px
-        );
-        transform: rotate(7deg);
-        pointer-events:none;
+        box-shadow: 0 12px 28px rgba(0,0,0,0.18);
       }
 
       .tag{
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-        color: rgba(236,243,255,0.94);
-        letter-spacing: 0.12em;
-        text-transform: uppercase;
-        font-size: 0.85rem;
-        text-shadow: 0 0 22px rgba(167,240,255,0.28);
+        color: rgba(236,243,255,0.96);
+        letter-spacing: 0.01em;
+        font-size: 1.15rem;
+        font-weight: 600;
       }
-      .tag .blue{ color: var(--blue); }
       .sub{ color: var(--muted); margin-top: 0.25rem; }
 
       .micro{
@@ -475,17 +537,6 @@ def _apply_cyberlife_ui(*, water_uri: str | None, overlay_uri: str | None) -> No
         font-size: 0.78rem;
       }
 
-      .y2k-chip{
-        display:inline-block;
-        padding: 2px 8px;
-        border-radius: 999px;
-        border: 1px solid rgba(167,240,255,0.30);
-        background: rgba(255,255,255,0.08);
-        backdrop-filter: blur(8px);
-        box-shadow: 0 0 22px rgba(167,240,255,0.18);
-      }
-
-      /* Footer */
       .footer{
         margin-top: 18px;
         text-align: center;
@@ -498,9 +549,52 @@ def _apply_cyberlife_ui(*, water_uri: str | None, overlay_uri: str | None) -> No
         display:inline-block;
         padding: 6px 10px;
         border-radius: 999px;
-        border: 1px solid rgba(167,240,255,0.16);
+        border: 1px solid rgba(167,240,255,0.12);
         background: rgba(255,255,255,0.04);
-        box-shadow: 0 0 24px rgba(167,240,255,0.10);
+      }
+
+      .conf-legend{
+        display:flex;
+        flex-wrap:wrap;
+        gap:8px;
+        margin: 8px 0 4px;
+      }
+
+      .conf-chip{
+        display:inline-flex;
+        align-items:center;
+        gap:6px;
+        border-radius:999px;
+        padding: 4px 10px;
+        font-size: 12px;
+        border:1px solid rgba(167,240,255,0.16);
+        background: rgba(255,255,255,0.04);
+        color: rgba(236,243,255,0.90);
+      }
+
+      .conf-chip.low{ border-color: rgba(255, 96, 136, 0.40); }
+      .conf-chip.mid{ border-color: rgba(255, 210, 107, 0.34); }
+      .conf-chip.good{ border-color: rgba(167,240,255,0.20); }
+
+      .conf-chip .dot{
+        width:8px;
+        height:8px;
+        border-radius:999px;
+        display:inline-block;
+      }
+
+      .conf-chip.low .dot{ background: rgba(255, 96, 136, 0.95); }
+      .conf-chip.mid .dot{ background: rgba(255, 210, 107, 0.95); }
+      .conf-chip.good .dot{ background: rgba(167,240,255,0.95); }
+
+      .brief-note{
+        margin-top:10px;
+        padding:10px 12px;
+        border-radius:14px;
+        border:1px solid rgba(167,240,255,0.14);
+        background: rgba(255,255,255,0.03);
+        color: rgba(185,212,255,0.88);
+        font-size: 0.92rem;
       }
     </style>
     """
@@ -511,7 +605,7 @@ def _apply_cyberlife_ui(*, water_uri: str | None, overlay_uri: str | None) -> No
 
 st.set_page_config(page_title="TRANSCRIBER", layout="centered")
 assets_dir = Path(__file__).parent / "assets" / "theme"
-_apply_cyberlife_ui(
+_apply_transcriber_ui(
     water_uri=_data_uri(assets_dir / "background.jpg"),
     overlay_uri=_data_uri(assets_dir / "overlay.jpg"),
 )
@@ -519,8 +613,8 @@ _apply_cyberlife_ui(
 st.markdown(
     """
     <div class="hud">
-      <div class="tag"><span class="blue">CYBERLIFE</span> AUDIO TRANSCRIPTION SUITE <span class="y2k-chip">Y2K</span></div>
-      <div class="sub">Local transcription (MP3/M4A/MP4) - outputs with timestamps + optional speakers</div>
+      <div class="tag">TRANSCRIBER</div>
+      <div class="sub">Local/private transcription console for audio and video files, with timestamps and optional speaker labels.</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -893,7 +987,11 @@ with tabs[1]:
     folder = st.text_input("Folder to watch", value="", placeholder=r"C:\path\to\folder")
     out_dir = st.text_input("Output folder", value="", placeholder=r"(default: <folder>\\_transcripts)")
     recursive = st.checkbox("Include subfolders", value=True)
-    use_hash = st.checkbox("Safer de-dupe (SHA256 hashing, slower)", value=False)
+    use_hash = st.checkbox("Hash changed files before skip (safer, slower)", value=False)
+    always_hash_before_skip = st.checkbox("Always hash before skip (correctness-first, slowest)", value=False)
+    st.caption(
+        "Default de-duplication skips files by size + modified time. Hash modes add extra disk I/O but catch copied/replaced-file edge cases more reliably."
+    )
 
     hotfolder_deps = bool(importlib.util.find_spec("watchdog"))
     if not hotfolder_deps:
@@ -926,13 +1024,24 @@ with tabs[1]:
         state = load_state(out_dir_path)
         files = iter_audio_files(folder_path, recursive=bool(recursive))
         new_files: list[Path] = []
+        state_dirty = False
         for f in files:
             key = rel_key(folder_path, f)
-            sig = stat_signature(f)
-            prev = state.get(key)
-            if prev and prev.size == sig.size and prev.mtime_ns == sig.mtime_ns and (not use_hash or prev.sha256):
+            decision = decide_file_action(
+                f,
+                state.get(key),
+                use_hash=bool(use_hash),
+                always_hash_before_skip=bool(always_hash_before_skip),
+            )
+            if not decision.should_process:
+                if decision.persist_state:
+                    state[key] = decision.signature
+                    state_dirty = True
                 continue
             new_files.append(f)
+
+        if state_dirty:
+            save_state(out_dir_path, state)
 
         st.write(f"Found {len(files)} audio file(s). New/changed: {len(new_files)}.")
         if not new_files:
@@ -963,11 +1072,20 @@ with tabs[1]:
         for i, f in enumerate(new_files, start=1):
             status.markdown(f"**Transcribing:** `{f.name}` (`{i}/{len(new_files)}`)")
             try:
-                transcribe_file(in_path=f, out_dir=out_dir_path, options=options, progress_cb=None, preview_cb=None)
-                sig = stat_signature(f)
                 key = rel_key(folder_path, f)
-                sha = sha256_file(f) if use_hash else None
-                state[key] = FileSignature(size=sig.size, mtime_ns=sig.mtime_ns, sha256=sha)
+                decision = decide_file_action(
+                    f,
+                    state.get(key),
+                    use_hash=bool(use_hash),
+                    always_hash_before_skip=bool(always_hash_before_skip),
+                )
+                if not decision.should_process:
+                    if decision.persist_state:
+                        state[key] = decision.signature
+                        save_state(out_dir_path, state)
+                    continue
+                transcribe_file(in_path=f, out_dir=out_dir_path, options=options, progress_cb=None, preview_cb=None)
+                state[key] = decision.signature
                 save_state(out_dir_path, state)
             except Exception as e:
                 st.error(f"{f.name}: {e}")
@@ -1007,6 +1125,8 @@ with tabs[1]:
             cmd.append("--recursive")
         if use_hash:
             cmd.append("--hash")
+        if always_hash_before_skip:
+            cmd.append("--always-hash-before-skip")
         if enable_speakers and speakers_available:
             cmd += ["--speakers", str(int(num_speakers))]
         cmd += ["--style", transcript_style]
@@ -1054,16 +1174,47 @@ with tabs[2]:
         """
         <div class="hud" style="padding:10px 12px; margin-top: 6px;">
           <div class="micro">TRANSCRIPT VIEW</div>
-          <div class="sub">Search and skim. Download the ZIP from the Transcribe tab.</div>
+          <div class="sub">Search and skim. You can also reopen a saved transcript ZIP or output folder.</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+    load_zip = st.file_uploader("Load saved transcript ZIP", type=["zip"], key="load_saved_zip")
+    load_folder = st.text_input(
+        "Or load saved transcript folder",
+        value="",
+        placeholder="/path/to/_transcripts",
+        key="load_saved_folder",
+    )
+    load_existing = st.button("Load saved outputs", use_container_width=True)
+
+    if load_existing:
+        try:
+            if load_zip is not None:
+                transcripts, briefs, outputs, zip_bytes = _load_saved_outputs_from_zip_bytes(load_zip.getvalue())
+            elif load_folder.strip():
+                load_root = Path(load_folder).expanduser()
+                if not load_root.exists() or not load_root.is_dir():
+                    raise FileNotFoundError(f"Saved output folder not found: {load_root}")
+                transcripts, briefs, outputs, zip_bytes = _load_saved_outputs_from_dir(load_root)
+            else:
+                raise RuntimeError("Choose a transcript ZIP or an output folder first.")
+
+            if not transcripts:
+                raise RuntimeError("No transcript outputs were found in the selected ZIP/folder.")
+
+            st.session_state.last_transcripts = transcripts
+            st.session_state.last_briefs = briefs
+            st.session_state.last_outputs = outputs
+            st.session_state.last_zip_bytes = zip_bytes
+            st.success(f"Loaded {len(transcripts)} transcript output(s).")
+        except Exception as exc:
+            st.error(f"Could not load saved outputs: {exc}")
 
     transcripts: dict[str, str] = st.session_state.get("last_transcripts") or {}
     outputs: dict[str, dict] = st.session_state.get("last_outputs") or {}
     if not transcripts:
-        st.info("No transcript yet. Run a transcription first.")
+        st.info("No transcript loaded yet. Run a transcription first, or load a saved ZIP/folder above.")
         st.stop()
 
     files = sorted(transcripts.keys())
@@ -1080,6 +1231,15 @@ with tabs[2]:
     skipped_total = int(output_meta.get("skipped_total") or 0)
     skipped_vad = int(output_meta.get("skipped_vad_empty") or 0)
     skipped_quiet = int(output_meta.get("skipped_quiet") or 0)
+    with st.expander("Diagnostics", expanded=False):
+        st.write(
+            {
+                "warning_summary": output_meta.get("warning_summary"),
+                "skipped_summary": output_meta.get("skipped_summary"),
+                "preflight": output_meta.get("preflight") or {},
+                "run_stats": output_meta.get("run_stats") or {},
+            }
+        )
     if warnings or skipped_total:
         st.markdown(
             """
@@ -1157,6 +1317,8 @@ with tabs[2]:
                 unsafe_allow_html=True,
             )
             st.audio(audio_bytes)
+    else:
+        st.caption("Playback preview is unavailable for this result set. Load the ZIP output to restore bundled audio artifacts.")
 
     # Segment-first transcript view (uses segments.json metadata).
     if segs:
@@ -1169,6 +1331,17 @@ with tabs[2]:
             """,
             unsafe_allow_html=True,
         )
+        st.markdown(
+            """
+            <div class="conf-legend">
+              <span class="conf-chip low"><span class="dot"></span>Low confidence</span>
+              <span class="conf-chip mid"><span class="dot"></span>Review</span>
+              <span class="conf-chip good"><span class="dot"></span>Stronger match</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.caption("Confidence is estimated from Whisper metadata (avg_logprob, no_speech_prob, compression_ratio).")
 
         def _conf_score(s: dict) -> float:
             w = s.get("whisper") or {}
@@ -1246,8 +1419,12 @@ with tabs[2]:
             cls = "good"
             if sc < float(low_threshold):
                 cls = "low"
+                conf_label = "Low confidence"
             elif sc < float(low_threshold) + 0.15:
                 cls = "mid"
+                conf_label = "Review"
+            else:
+                conf_label = "Stronger match"
 
             spk_conf = s.get("speaker_confidence")
             spk_conf_txt = ""
@@ -1260,7 +1437,7 @@ with tabs[2]:
             blocks.append(
                 f"""
                 <div class="seg {cls}" onclick="window.__transcriber_jump && window.__transcriber_jump({start:.3f});">
-                  <div class="seg-h">{_html.escape(_format_duration(start))} <span class="spk">{_html.escape(spk)}</span> <span class="sc">{sc:.2f}{_html.escape(spk_conf_txt)}</span></div>
+                  <div class="seg-h">{_html.escape(_format_duration(start))} <span class="spk">{_html.escape(spk)}</span> <span class="conf-chip {cls}"><span class="dot"></span>{_html.escape(conf_label)}</span> <span class="sc">{sc:.2f}{_html.escape(spk_conf_txt)}</span></div>
                   <div class="seg-t">{_html.escape(txt)}</div>
                 </div>
                 """
@@ -1276,12 +1453,12 @@ with tabs[2]:
               .seg{ cursor: pointer; transition: transform .08s ease, box-shadow .12s ease; }
               .seg:hover{ transform: translateY(-1px); box-shadow: 0 18px 40px rgba(0,0,0,0.22); }
               .seg-h{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-                      color: rgba(236,243,255,0.82); letter-spacing: .10em; text-transform: uppercase; font-size: .75rem; display:flex; gap:10px; align-items:center; }
+                      color: rgba(236,243,255,0.82); letter-spacing: .05em; font-size: .75rem; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
               .seg-h .spk{ color: rgba(167,240,255,0.95); }
               .seg-h .sc{ margin-left:auto; color: rgba(185,212,255,0.85); }
               .seg-t{ margin-top:6px; color: rgba(236,243,255,0.92); }
-              .seg.low{ border-color: rgba(255, 96, 136, 0.45); box-shadow: 0 0 24px rgba(255, 96, 136, 0.12); }
-              .seg.mid{ border-color: rgba(255, 210, 107, 0.40); box-shadow: 0 0 24px rgba(255, 210, 107, 0.10); }
+              .seg.low{ border-color: rgba(255, 96, 136, 0.35); }
+              .seg.mid{ border-color: rgba(255, 210, 107, 0.30); }
               .seg.good{ border-color: rgba(167,240,255,0.16); }
             </style>
             """,
@@ -1321,7 +1498,17 @@ with tabs[2]:
             """
             <div class="hud" style="padding:10px 12px; margin-top: 10px;">
               <div class="micro">BRIEF PACK</div>
-              <div class="sub">Copy/paste for leadership or ops channels.</div>
+              <div class="sub">Copy/paste outputs plus heuristic highlights from the generated brief.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            """
+            <div class="brief-note">
+              Heuristic highlights in <code>brief.md</code> and <code>brief.html</code> are chosen automatically.
+              The picker favors longer, higher-confidence, information-dense moments (for example numbers, questions, and named entities)
+              while spreading selections across the timeline.
             </div>
             """,
             unsafe_allow_html=True,

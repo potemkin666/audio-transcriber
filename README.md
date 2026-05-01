@@ -1,6 +1,6 @@
 # TRANSCRIBER
 
-TRANSCRIBER is a local Whisper-based app for turning audio and video files into transcripts on your own machine. The runnable project lives in the `app/` directory.
+TRANSCRIBER is a local Whisper-based app for turning audio and video files into transcripts on your own machine. The runnable project lives in the `app/` directory. Its UI is intentionally positioned as a local/private transcription console rather than a cloud dashboard.
 
 No environment variables are required for standard local use.
 

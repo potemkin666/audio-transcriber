@@ -1,6 +1,6 @@
 # TRANSCRIBER
 
-TRANSCRIBER is a local app for turning audio and video files into transcripts. It runs Whisper on your computer, so your files are not uploaded to a cloud transcription service.
+TRANSCRIBER is a local app for turning audio and video files into transcripts. It runs Whisper on your computer, so your files are not uploaded to a cloud transcription service. The app presents itself as a local/private transcription console with a sober dark-blue interface.
 
 No environment variables are required for standard local use.
 
@@ -106,6 +106,21 @@ bash ./setup_unix.sh
 ```
 
 If `setup_unix.sh` stops with an error, fix the missing prerequisite shown in the terminal and rerun the same command.
+
+## Supported pip install path
+
+If you are installing from source instead of using the launcher scripts, the supported package install path is:
+
+```bash
+python -m pip install .
+```
+
+Optional extras:
+
+```bash
+python -m pip install .[hotfolder]
+python -m pip install .[speakers]
+```
 
 First successful run confirmation on macOS/Linux:
 

@@ -97,15 +97,17 @@ def decide_file_action(
     sig = stat_signature(p)
     same_meta = bool(previous and previous.size == sig.size and previous.mtime_ns == sig.mtime_ns)
 
-    if previous is None:
-        return FileDecision(should_process=True, signature=sig)
-
     if always_hash_before_skip:
         sha = sha256_file(p)
         current = FileSignature(size=sig.size, mtime_ns=sig.mtime_ns, sha256=sha)
+        if previous is None:
+            return FileDecision(should_process=True, signature=current)
         if previous.sha256 and previous.sha256 == sha:
             return FileDecision(should_process=False, signature=current, persist_state=True)
         return FileDecision(should_process=True, signature=current)
+
+    if previous is None:
+        return FileDecision(should_process=True, signature=sig)
 
     if not use_hash:
         return FileDecision(should_process=not same_meta, signature=sig)

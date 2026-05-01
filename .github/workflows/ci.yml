@@ -68,3 +68,5 @@ jobs:
           )
           print("format ok")
           PY
+      - name: Unit and smoke tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v
