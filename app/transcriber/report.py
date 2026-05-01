@@ -176,6 +176,13 @@ def _top_moments(segments: list[dict], *, top_n: int = 10) -> list[dict]:
     return picked
 
 
+def _highlights_note() -> str:
+    return (
+        "Heuristic highlights are selected automatically. The scorer favors longer, higher-confidence, "
+        "information-dense moments (such as digits, questions, and named entities) while spreading picks across the timeline."
+    )
+
+
 def build_brief_snippets(
     *,
     input_name: str,
@@ -202,7 +209,7 @@ def build_brief_snippets(
             f"Speakers: {spk_line}",
             f"Keywords: {kw_line}",
             "",
-            "Key moments (timestamped):",
+            "Heuristic highlights (timestamped):",
             *bullets,
         ]
     ).strip() + "\n"
@@ -271,7 +278,9 @@ def write_brief_pack(
             md_lines.append(f"- {w}")
         md_lines.append("")
 
-    md_lines.append("## Top moments")
+    md_lines.append("## Heuristic highlights")
+    md_lines.append(_highlights_note())
+    md_lines.append("")
     for s in moments[:10]:
         ts = _hms(float(s.get("start") or 0.0))
         spk = (s.get("speaker") or "").strip()
@@ -397,7 +406,8 @@ def write_brief_pack(
     {"<div class='card'><h2>Preflight</h2>" + preflight_html + "</div>" if preflight_html else ""}
 
     <div class="card">
-      <h2>Top moments</h2>
+      <h2>Heuristic highlights</h2>
+      <div class="meta">{esc(_highlights_note())}</div>
       <ul>{moments_html}</ul>
     </div>
 

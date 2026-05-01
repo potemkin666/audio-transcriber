@@ -19,11 +19,13 @@ import streamlit.components.v1 as components
 
 from transcriber.core import TranscriptionOptions, prepare_whisper_model, transcribe_file
 from transcriber.ffmpeg import ensure_ffmpeg_available, probe_duration_seconds, ffmpeg_version_line, ffprobe_version_line, find_ffmpeg_tools
-from transcriber.hotfolder import FileSignature, iter_audio_files, load_state, rel_key, save_state, sha256_file, stat_signature
+from transcriber.hotfolder import decide_file_action, iter_audio_files, load_state, rel_key, save_state
 from transcriber.telemetry import get_rtf
 
 
 SUPPORTED_TYPES = ["mp3", "m4a", "mp4", "aac", "wav", "flac", "ogg", "m4b", "webm"]
+# Keep the experimental command palette out of the public UI until onboarding and accessibility are stronger.
+ENABLE_COMMAND_PALETTE = False
 
 
 def _zip_dir(root: Path) -> bytes:
@@ -95,6 +97,338 @@ def _clear_qp(name: str) -> None:
             pass
 
 
+def _safe_dom_id(value: str, *, prefix: str = "tr") -> str:
+    cleaned = "".join(ch if ch.isalnum() else "_" for ch in str(value or ""))
+    cleaned = cleaned.strip("_")[:80]
+    return f"{prefix}_{cleaned or 'item'}"
+
+
+def _safe_uploaded_filename(name: str, *, index: int) -> str:
+    raw_name = Path(str(name or "")).name
+    suffix = Path(raw_name).suffix.lower()
+    if suffix.lstrip(".") not in SUPPORTED_TYPES:
+        suffix = ".wav"
+    return f"upload_{index:02d}{suffix}"
+
+
+def _copy_text_widget(*, key: str, label: str, value: str, height: int = 140) -> None:
+    dom_id = _safe_dom_id(key, prefix="copy")
+    st.text_area(label, value=value, height=height, key=f"{dom_id}_value")
+    payload = base64.b64encode(value.encode("utf-8")).decode("ascii")
+    components.html(
+        f"""
+        <div style="margin:-4px 0 4px;">
+          <button id="{dom_id}_btn" type="button" aria-label="Copy {label} to clipboard"
+            style="width:100%; padding:10px 12px; border-radius:14px; border:1px solid rgba(167,240,255,0.18);
+                   background: rgba(255,255,255,0.06); color: rgba(236,243,255,0.92);
+                   letter-spacing:0.06em; text-transform:uppercase; cursor:pointer;">
+            Copy
+          </button>
+          <div id="{dom_id}_status" role="status" aria-live="polite"
+            style="margin-top:6px; color:rgba(185,212,255,0.75); font-size:12px;">
+            Tip: the text box also supports standard keyboard copy shortcuts.
+          </div>
+        </div>
+        <script>
+          (function(){{
+            const btn = document.getElementById("{dom_id}_btn");
+            const status = document.getElementById("{dom_id}_status");
+            const decoded = atob("{payload}");
+            async function copyText() {{
+              try {{
+                if (navigator.clipboard && navigator.clipboard.writeText) {{
+                  await navigator.clipboard.writeText(decoded);
+                }} else {{
+                  const ta = document.createElement("textarea");
+                  ta.value = decoded;
+                  ta.setAttribute("readonly", "");
+                  ta.style.position = "fixed";
+                  ta.style.opacity = "0";
+                  document.body.appendChild(ta);
+                  ta.select();
+                  document.execCommand("copy");
+                  document.body.removeChild(ta);
+                }}
+                if (status) status.textContent = "Copied to clipboard.";
+                if (btn) btn.textContent = "Copied";
+                setTimeout(() => {{
+                  if (status) status.textContent = "Tip: the text box also supports standard keyboard copy shortcuts.";
+                  if (btn) btn.textContent = "Copy";
+                }}, 1200);
+              }} catch (err) {{
+                if (status) status.textContent = "Copy failed. Use Ctrl+C or Cmd+C from the text box.";
+                if (btn) btn.textContent = "Copy failed";
+                setTimeout(() => {{
+                  if (btn) btn.textContent = "Copy";
+                }}, 1400);
+              }}
+            }}
+            if (btn) {{
+              btn.addEventListener("click", copyText);
+              btn.addEventListener("keydown", (event) => {{
+                if (event.key === "Enter" || event.key === " ") {{
+                  event.preventDefault();
+                  copyText();
+                }}
+              }});
+            }}
+          }})();
+        </script>
+        """,
+        height=78,
+    )
+
+
+def _queue_status_details(*, status: str, error_message: str | None = None, output_meta: dict | None = None) -> tuple[str, str]:
+    normalized = str(status or "").strip().lower()
+    if normalized == "queued":
+        return "🟡 Queued", "Ready to start. Press Transcribe when the queue looks right."
+    if normalized == "running":
+        return "🔵 Running", "Wait for this file to finish. Live preview updates during transcription."
+    if normalized == "done":
+        meta = output_meta if isinstance(output_meta, dict) else {}
+        if (meta.get("warnings") or []) or int(meta.get("skipped_total") or 0):
+            return "✅ Done", "Review Transcript → Diagnostics for warnings or skipped-audio counts."
+        return "✅ Done", "Included in the final ZIP."
+
+    msg = str(error_message or "").strip()
+    lower = msg.lower()
+    if "ffmpeg" in lower or "ffprobe" in lower:
+        return "❌ Needs FFmpeg", "Install FFmpeg or rerun setup, then retry this file."
+    if "speaker labeling requires extra deps" in lower or "requirements-speakers" in lower or "speechbrain" in lower:
+        return "❌ Speaker setup", "Install speaker-label dependencies or turn speaker labels off and retry."
+    if "download" in lower or "network" in lower or "http" in lower or "timeout" in lower or "connection" in lower:
+        return "❌ Retry download", "Retry after the model download finishes, or choose a smaller model."
+    return "❌ Needs attention", "Retry this file. If it fails again, check Build info or adjust model/settings."
+
+
+def _hotfolder_placeholders() -> tuple[str, str]:
+    if os.name == "nt":
+        return (r"C:\Users\you\Desktop\incoming-audio", r"C:\Users\you\Desktop\incoming-audio\_transcripts")
+    return ("~/Desktop/incoming-audio", "~/Desktop/incoming-audio/_transcripts")
+
+
+def _read_json_file(path: Path) -> dict | list | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        item = str(value or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def _build_output_meta(*, preflight: dict | None = None, run_stats: dict | None = None, diarization: dict | None = None) -> dict:
+    preflight_warnings = []
+    if isinstance(preflight, dict):
+        preflight_warnings = [str(w).strip() for w in (preflight.get("warnings") or []) if str(w).strip()]
+
+    run_warnings = []
+    counts: dict = {}
+    if isinstance(run_stats, dict):
+        run_warnings = [str(w).strip() for w in (run_stats.get("warnings") or []) if str(w).strip()]
+        counts = run_stats.get("counts") if isinstance(run_stats.get("counts"), dict) else {}
+
+    warnings = _dedupe_preserve_order(preflight_warnings + run_warnings)
+    skipped_vad = int(counts.get("chunks_skipped_vad_empty") or 0)
+    skipped_quiet = int(counts.get("chunks_skipped_quiet") or 0)
+    skipped_total = int(counts.get("chunks_skipped_total") or counts.get("chunks_skipped_silence") or (skipped_vad + skipped_quiet))
+
+    warning_summary = "—"
+    if warnings:
+        warning_summary = warnings[0] if len(warnings) == 1 else f"{warnings[0]} (+{len(warnings) - 1} more)"
+
+    skipped_summary = "—"
+    if skipped_total:
+        details = []
+        if skipped_vad:
+            details.append(f"{skipped_vad} VAD-empty")
+        if skipped_quiet:
+            details.append(f"{skipped_quiet} ultra-quiet")
+        detail_txt = f" ({', '.join(details)})" if details else ""
+        skipped_summary = f"{skipped_total}{detail_txt}"
+
+    return {
+        "preflight": preflight if isinstance(preflight, dict) else {},
+        "run_stats": run_stats if isinstance(run_stats, dict) else {},
+        "diarization": diarization if isinstance(diarization, dict) else {},
+        "warnings": warnings,
+        "warning_summary": warning_summary,
+        "skipped_total": skipped_total,
+        "skipped_vad_empty": skipped_vad,
+        "skipped_quiet": skipped_quiet,
+        "skipped_summary": skipped_summary,
+    }
+
+
+def _load_output_meta(output_dir: Path) -> dict:
+    preflight = _read_json_file(output_dir / "preflight.json")
+    run_stats = _read_json_file(output_dir / "run_stats.json")
+    diarization = _read_json_file(output_dir / "diarization.json")
+    return _build_output_meta(
+        preflight=preflight if isinstance(preflight, dict) else None,
+        run_stats=run_stats if isinstance(run_stats, dict) else None,
+        diarization=diarization if isinstance(diarization, dict) else None,
+    )
+
+
+def _unique_output_name(name: str, existing: dict[str, str]) -> str:
+    base = str(name or "").strip() or "Transcript"
+    if base not in existing:
+        return base
+    idx = 2
+    while f"{base} ({idx})" in existing:
+        idx += 1
+    return f"{base} ({idx})"
+
+
+def _collect_saved_outputs(rows: list[dict], *, zip_bytes: bytes | None = None) -> tuple[dict[str, str], dict[str, dict], dict[str, dict], bytes | None]:
+    transcripts: dict[str, str] = {}
+    briefs: dict[str, dict] = {}
+    outputs: dict[str, dict] = {}
+    for row in rows:
+        transcript_text = str(row.get("transcript") or "")
+        if not transcript_text.strip():
+            continue
+        stem = str(row.get("stem") or "").strip()
+        run_stats = row.get("run_stats") if isinstance(row.get("run_stats"), dict) else {}
+        input_name = str(run_stats.get("input_name") or row.get("display_name") or stem or "Transcript")
+        display_name = _unique_output_name(input_name, transcripts)
+        meta = _build_output_meta(
+            preflight=row.get("preflight") if isinstance(row.get("preflight"), dict) else None,
+            run_stats=run_stats if isinstance(run_stats, dict) else None,
+            diarization=row.get("diarization") if isinstance(row.get("diarization"), dict) else None,
+        )
+        transcripts[display_name] = transcript_text
+        if isinstance(row.get("brief"), dict):
+            briefs[display_name] = row["brief"]
+        outputs[display_name] = {
+            "stem": stem,
+            "segments": row.get("segments") if isinstance(row.get("segments"), list) else None,
+            "meta": meta,
+        }
+    return transcripts, briefs, outputs, zip_bytes
+
+
+def _load_saved_outputs_from_zip_bytes(zip_bytes: bytes) -> tuple[dict[str, str], dict[str, dict], dict[str, dict], bytes | None]:
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), mode="r") as zf:
+        stems = sorted(
+            {
+                Path(name).parts[0]
+                for name in zf.namelist()
+                if name and not name.endswith("/") and len(Path(name).parts) > 1
+            }
+        )
+        rows: list[dict] = []
+        for stem in stems:
+            def _read_text(member: str) -> str | None:
+                try:
+                    return zf.read(member).decode("utf-8", errors="replace")
+                except Exception:
+                    return None
+
+            def _read_json(member: str) -> dict | list | None:
+                try:
+                    return json.loads(zf.read(member).decode("utf-8"))
+                except Exception:
+                    return None
+
+            transcript = _read_text(f"{stem}/transcript.txt")
+            if not transcript:
+                continue
+            rows.append(
+                {
+                    "stem": stem,
+                    "display_name": stem,
+                    "transcript": transcript,
+                    "segments": _read_json(f"{stem}/segments.json"),
+                    "brief": _read_json(f"{stem}/brief_snippets.json"),
+                    "preflight": _read_json(f"{stem}/preflight.json"),
+                    "run_stats": _read_json(f"{stem}/run_stats.json"),
+                    "diarization": _read_json(f"{stem}/diarization.json"),
+                }
+            )
+    return _collect_saved_outputs(rows, zip_bytes=zip_bytes)
+
+
+def _load_saved_outputs_from_dir(root: Path) -> tuple[dict[str, str], dict[str, dict], dict[str, dict], bytes | None]:
+    rows: list[dict] = []
+    for output_dir in sorted([p for p in root.iterdir() if p.is_dir()]):
+        transcript_path = output_dir / "transcript.txt"
+        if not transcript_path.exists():
+            continue
+        try:
+            transcript = transcript_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        rows.append(
+            {
+                "stem": output_dir.name,
+                "display_name": output_dir.name,
+                "transcript": transcript,
+                "segments": _read_json_file(output_dir / "segments.json"),
+                "brief": _read_json_file(output_dir / "brief_snippets.json"),
+                "preflight": _read_json_file(output_dir / "preflight.json"),
+                "run_stats": _read_json_file(output_dir / "run_stats.json"),
+                "diarization": _read_json_file(output_dir / "diarization.json"),
+            }
+        )
+    return _collect_saved_outputs(rows, zip_bytes=_zip_dir(root))
+
+
+def _validated_saved_output_dir(path_text: str) -> Path:
+    raw = str(path_text or "").strip()
+    if not raw:
+        raise RuntimeError("Choose a transcript ZIP or an output folder first.")
+    if any(ch in raw for ch in ("\x00", "\n", "\r")):
+        raise RuntimeError("Folder path contains unsupported characters.")
+
+    resolved = Path(raw).expanduser().resolve(strict=True)
+    if not resolved.is_dir():
+        raise FileNotFoundError(f"Saved output folder not found: {resolved}")
+
+    allowed_roots = [Path.home().resolve(), Path.cwd().resolve()]
+    if not any(resolved == root or root in resolved.parents for root in allowed_roots):
+        raise RuntimeError("Choose a saved output folder under your home directory or the current workspace.")
+    return resolved
+
+
+def _speaker_confidence_badge(value: float | None) -> tuple[str, str, str]:
+    if value is None:
+        return (
+            "Speaker match: n/a",
+            "mid",
+            "Speaker-label confidence is unavailable for this segment.",
+        )
+    score = max(0.0, min(1.0, float(value)))
+    if score >= 0.75:
+        level = "High"
+        css = "good"
+    elif score >= 0.45:
+        level = "Medium"
+        css = "mid"
+    else:
+        level = "Low"
+        css = "low"
+    return (
+        f"Speaker match: {level}",
+        css,
+        (
+            "Heuristic speaker-label confidence derived from distance to the assigned "
+            f"KMeans centroid. Raw score: {score:.2f}."
+        ),
+    )
+
+
 def _command_palette(commands: list[dict]) -> None:
     payload = json.dumps(commands)
     components.html(
@@ -152,10 +486,25 @@ def _command_palette(commands: list[dict]) -> None:
             items.forEach((c, i) => {{
               const div = document.createElement('div');
               div.className = 'tr_cmd_item';
+              div.setAttribute('role', 'button');
+              div.setAttribute('tabindex', '0');
               div.style.opacity = (i===idx) ? '1.0' : '0.92';
               div.style.borderColor = (i===idx) ? 'rgba(167,240,255,0.34)' : 'rgba(167,240,255,0.10)';
-              div.innerHTML = `<div class="tr_cmd_title">${{c.title}}</div><div class="tr_cmd_desc">${{c.desc||''}}</div>`;
+              const title = document.createElement('div');
+              title.className = 'tr_cmd_title';
+              title.textContent = c.title || '';
+              const desc = document.createElement('div');
+              desc.className = 'tr_cmd_desc';
+              desc.textContent = c.desc || '';
+              div.appendChild(title);
+              div.appendChild(desc);
               div.onclick = () => run(c);
+              div.onkeydown = (event) => {{
+                if (event.key === 'Enter' || event.key === ' ') {{
+                  event.preventDefault();
+                  run(c);
+                }}
+              }};
               list.appendChild(div);
             }});
             overlay.dataset.items = JSON.stringify(items);
@@ -223,7 +572,7 @@ def _data_uri(path: Path) -> str | None:
     return f"data:{mime};base64,{b64}"
 
 
-def _apply_cyberlife_ui(*, water_uri: str | None, overlay_uri: str | None) -> None:
+def _apply_transcriber_ui(*, water_uri: str | None, overlay_uri: str | None) -> None:
     water_css = f"background-image: url('{water_uri}');" if water_uri else ""
     overlay_css = f"background-image: url('{overlay_uri}');" if overlay_uri else ""
 
@@ -236,20 +585,19 @@ def _apply_cyberlife_ui(*, water_uri: str | None, overlay_uri: str | None) -> No
         --muted:#B9D4FF;
         --blue:#4BB4FF;
         --cyan:#A7F0FF;
-        --line: rgba(75,180,255,0.40);
-        --line2: rgba(167,240,255,0.28);
-        --glass: rgba(255,255,255,0.10);
+        --line: rgba(75,180,255,0.24);
+        --line2: rgba(167,240,255,0.18);
+        --glass: rgba(255,255,255,0.06);
       }
 
       html, body, [data-testid="stAppViewContainer"]{
         background:
-          radial-gradient(1200px 760px at 70% 10%, rgba(75,180,255,0.42), transparent 58%),
-          radial-gradient(980px 600px at 25% 45%, rgba(167,240,255,0.24), transparent 62%),
+          radial-gradient(1200px 760px at 70% 10%, rgba(75,180,255,0.24), transparent 58%),
+          radial-gradient(980px 600px at 25% 45%, rgba(167,240,255,0.14), transparent 62%),
           linear-gradient(180deg, var(--bg0), var(--bg1));
         color: var(--ink);
       }
 
-      /* Water texture overlay */
       [data-testid="stAppViewContainer"]::before{
         content:"";
         position: fixed;
@@ -257,39 +605,25 @@ def _apply_cyberlife_ui(*, water_uri: str | None, overlay_uri: str | None) -> No
         __WATER_CSS__
         background-size: cover;
         background-position: center;
-        opacity: 0.46;
-        filter: saturate(1.45) contrast(1.10) brightness(1.18);
-        animation: driftA 22s ease-in-out infinite alternate;
+        opacity: 0.10;
+        filter: saturate(1.0) contrast(1.0) brightness(1.02);
         pointer-events: none;
         z-index: 0;
       }
 
-      /* Bright overlay shards */
       [data-testid="stAppViewContainer"]::after{
         content:"";
         position: fixed;
-        inset: -10%;
+        inset: 0;
         __OVERLAY_CSS__
         background-size: cover;
         background-position: center;
-        opacity: 0.30;
-        filter: saturate(1.45) contrast(1.18) brightness(1.20) blur(0.25px);
-        mix-blend-mode: screen;
-        animation: driftB 28s ease-in-out infinite alternate;
+        opacity: 0.04;
+        filter: saturate(0.9) contrast(1.0) brightness(1.0);
         pointer-events: none;
         z-index: 0;
       }
 
-      @keyframes driftA {
-        0%   { transform: translate3d(0px, 0px, 0px) scale(1.02); }
-        100% { transform: translate3d(-10px, 14px, 0px) scale(1.05); }
-      }
-      @keyframes driftB {
-        0%   { transform: translate3d(0px, 0px, 0px) scale(1.03); }
-        100% { transform: translate3d(16px, -12px, 0px) scale(1.06); }
-      }
-
-      /* Lift app above overlay */
       [data-testid="stAppViewContainer"] > .main {
         position: relative;
         z-index: 1;
@@ -297,83 +631,53 @@ def _apply_cyberlife_ui(*, water_uri: str | None, overlay_uri: str | None) -> No
 
       [data-testid="stHeader"]{ background: transparent; }
       [data-testid="stSidebar"]{
-        background: rgba(255,255,255,0.06);
-        border-right: 1px solid rgba(167,240,255,0.25);
-        backdrop-filter: blur(10px);
+        background: rgba(6, 18, 33, 0.72);
+        border-right: 1px solid rgba(167,240,255,0.16);
       }
 
       .block-container{ padding-top: 1.0rem; }
 
       h1, h2, h3{
-        letter-spacing: 0.06em;
-        text-transform: uppercase;
+        letter-spacing: 0.01em;
+        text-transform: none;
       }
 
-      /* Buttons */
       button[kind="primary"]{
-        background: linear-gradient(90deg, rgba(167,240,255,0.95), rgba(75,180,255,0.95)) !important;
+        background: linear-gradient(180deg, rgba(167,240,255,0.94), rgba(113,200,255,0.94)) !important;
         color: #03101F !important;
         border: 0 !important;
-        letter-spacing: 0.03em;
-        text-transform: uppercase;
-        box-shadow:
-          0 0 0 1px rgba(167,240,255,0.25),
-          0 12px 30px rgba(75,180,255,0.28),
-          0 0 30px rgba(167,240,255,0.18) !important;
+        letter-spacing: 0.01em;
+        text-transform: none;
+        box-shadow: 0 10px 22px rgba(6, 18, 33, 0.22) !important;
       }
 
-      /* Progress */
       div[data-testid="stProgress"] > div{ background: rgba(75,180,255,0.22); }
       div[data-testid="stProgress"] div[role="progressbar"]{
         background: linear-gradient(90deg, var(--blue), var(--cyan));
-        box-shadow: 0 0 22px rgba(167,240,255,0.25);
+        box-shadow: none;
       }
 
-      /* Alerts */
       [data-testid="stAlert"]{
-        background: rgba(255,255,255,0.08);
-        border: 1px solid rgba(167,240,255,0.24);
+        background: rgba(255,255,255,0.05);
+        border: 1px solid rgba(167,240,255,0.18);
       }
 
-      /* HUD */
       .hud{
-        border: 1px solid rgba(167,240,255,0.26);
-        border-radius: 18px;
+        border: 1px solid rgba(167,240,255,0.18);
+        border-radius: 16px;
         padding: 14px 16px;
-        background: linear-gradient(180deg, rgba(255,255,255,0.12), rgba(255,255,255,0.05));
+        background: linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03));
         position: relative;
         overflow: hidden;
-        box-shadow:
-          0 0 0 1px rgba(167,240,255,0.20),
-          0 22px 54px rgba(0,0,0,0.35),
-          0 0 46px rgba(167,240,255,0.12);
-        backdrop-filter: blur(10px);
-      }
-
-      .hud:before{
-        content:"";
-        position:absolute;
-        left:-20%; top:-50%;
-        width: 140%; height: 200%;
-        background: repeating-linear-gradient(
-          0deg,
-          rgba(66,165,255,0.00),
-          rgba(66,165,255,0.00) 8px,
-          rgba(66,165,255,0.06) 9px
-        );
-        transform: rotate(7deg);
-        pointer-events:none;
+        box-shadow: 0 12px 28px rgba(0,0,0,0.18);
       }
 
       .tag{
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-        color: rgba(236,243,255,0.94);
-        letter-spacing: 0.12em;
-        text-transform: uppercase;
-        font-size: 0.85rem;
-        text-shadow: 0 0 22px rgba(167,240,255,0.28);
+        color: rgba(236,243,255,0.96);
+        letter-spacing: 0.01em;
+        font-size: 1.15rem;
+        font-weight: 600;
       }
-      .tag .blue{ color: var(--blue); }
       .sub{ color: var(--muted); margin-top: 0.25rem; }
 
       .micro{
@@ -384,17 +688,6 @@ def _apply_cyberlife_ui(*, water_uri: str | None, overlay_uri: str | None) -> No
         font-size: 0.78rem;
       }
 
-      .y2k-chip{
-        display:inline-block;
-        padding: 2px 8px;
-        border-radius: 999px;
-        border: 1px solid rgba(167,240,255,0.30);
-        background: rgba(255,255,255,0.08);
-        backdrop-filter: blur(8px);
-        box-shadow: 0 0 22px rgba(167,240,255,0.18);
-      }
-
-      /* Footer */
       .footer{
         margin-top: 18px;
         text-align: center;
@@ -407,9 +700,52 @@ def _apply_cyberlife_ui(*, water_uri: str | None, overlay_uri: str | None) -> No
         display:inline-block;
         padding: 6px 10px;
         border-radius: 999px;
-        border: 1px solid rgba(167,240,255,0.16);
+        border: 1px solid rgba(167,240,255,0.12);
         background: rgba(255,255,255,0.04);
-        box-shadow: 0 0 24px rgba(167,240,255,0.10);
+      }
+
+      .conf-legend{
+        display:flex;
+        flex-wrap:wrap;
+        gap:8px;
+        margin: 8px 0 4px;
+      }
+
+      .conf-chip{
+        display:inline-flex;
+        align-items:center;
+        gap:6px;
+        border-radius:999px;
+        padding: 4px 10px;
+        font-size: 12px;
+        border:1px solid rgba(167,240,255,0.16);
+        background: rgba(255,255,255,0.04);
+        color: rgba(236,243,255,0.90);
+      }
+
+      .conf-chip.low{ border-color: rgba(255, 96, 136, 0.40); }
+      .conf-chip.mid{ border-color: rgba(255, 210, 107, 0.34); }
+      .conf-chip.good{ border-color: rgba(167,240,255,0.20); }
+
+      .conf-chip .dot{
+        width:8px;
+        height:8px;
+        border-radius:999px;
+        display:inline-block;
+      }
+
+      .conf-chip.low .dot{ background: rgba(255, 96, 136, 0.95); }
+      .conf-chip.mid .dot{ background: rgba(255, 210, 107, 0.95); }
+      .conf-chip.good .dot{ background: rgba(167,240,255,0.95); }
+
+      .brief-note{
+        margin-top:10px;
+        padding:10px 12px;
+        border-radius:14px;
+        border:1px solid rgba(167,240,255,0.14);
+        background: rgba(255,255,255,0.03);
+        color: rgba(185,212,255,0.88);
+        font-size: 0.92rem;
       }
     </style>
     """
@@ -420,7 +756,7 @@ def _apply_cyberlife_ui(*, water_uri: str | None, overlay_uri: str | None) -> No
 
 st.set_page_config(page_title="TRANSCRIBER", layout="centered")
 assets_dir = Path(__file__).parent / "assets" / "theme"
-_apply_cyberlife_ui(
+_apply_transcriber_ui(
     water_uri=_data_uri(assets_dir / "background.jpg"),
     overlay_uri=_data_uri(assets_dir / "overlay.jpg"),
 )
@@ -428,8 +764,8 @@ _apply_cyberlife_ui(
 st.markdown(
     """
     <div class="hud">
-      <div class="tag"><span class="blue">CYBERLIFE</span> AUDIO TRANSCRIPTION SUITE <span class="y2k-chip">Y2K</span></div>
-      <div class="sub">Local transcription (MP3/M4A/MP4) - outputs with timestamps + optional speakers</div>
+      <div class="tag">TRANSCRIBER</div>
+      <div class="sub">Local/private transcription console for audio and video files, with timestamps and optional speaker labels.</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -469,32 +805,33 @@ for i in range(1, 7):
 for f in recent_files:
     cmds.append({"title": f"Select file: {f}", "desc": "Set Transcript view file selector", "cmd": "select_file", "arg": f})
 
-_command_palette(cmds)
+if ENABLE_COMMAND_PALETTE:
+    _command_palette(cmds)
 
-# Execute palette commands via query params (best-effort).
-cmd = _get_qp("cmd")
-arg = _get_qp("arg")
-if cmd:
-    try:
-        if cmd == "toggle_redact":
-            st.session_state["opt_redact"] = not bool(st.session_state.get("opt_redact", False))
-        elif cmd == "low_conf":
-            st.session_state["seg_low_only"] = True
-            st.session_state["seg_min_conf"] = 0.0
-            st.session_state["seg_low_threshold"] = 0.35
-        elif cmd == "speaker" and arg:
-            st.session_state["seg_speaker_filter"] = [str(arg)]
-        elif cmd == "select_file" and arg:
-            st.session_state["sel_file"] = str(arg)
-        elif cmd == "transcribe":
-            st.session_state["auto_transcribe"] = True
-        elif cmd == "brief":
-            st.session_state["focus_brief"] = True
-    except Exception:
-        pass
-    _clear_qp("cmd")
-    _clear_qp("arg")
-    st.rerun()
+    # Execute palette commands via query params (best-effort).
+    cmd = _get_qp("cmd")
+    arg = _get_qp("arg")
+    if cmd:
+        try:
+            if cmd == "toggle_redact":
+                st.session_state["opt_redact"] = not bool(st.session_state.get("opt_redact", False))
+            elif cmd == "low_conf":
+                st.session_state["seg_low_only"] = True
+                st.session_state["seg_min_conf"] = 0.0
+                st.session_state["seg_low_threshold"] = 0.35
+            elif cmd == "speaker" and arg:
+                st.session_state["seg_speaker_filter"] = [str(arg)]
+            elif cmd == "select_file" and arg:
+                st.session_state["sel_file"] = str(arg)
+            elif cmd == "transcribe":
+                st.session_state["auto_transcribe"] = True
+            elif cmd == "brief":
+                st.session_state["focus_brief"] = True
+        except Exception:
+            pass
+        _clear_qp("cmd")
+        _clear_qp("arg")
+        st.rerun()
 
 with st.sidebar:
     st.header("Settings")
@@ -520,6 +857,11 @@ with st.sidebar:
         disabled=(not enable_speakers) or (not speakers_available),
         key="opt_speakers",
     )
+    if enable_speakers and speakers_available:
+        st.caption(
+            "Speaker labels are optional diarization, not identity tracking. Pick the count if you know it; "
+            "otherwise start at 2 and review diarization metrics in Transcript → Diagnostics."
+        )
 
     transcript_style = st.selectbox(
         "Output style",
@@ -583,204 +925,231 @@ with st.sidebar:
 
 with tabs[0]:
     uploaded = st.file_uploader("Drop audio files here", type=SUPPORTED_TYPES, accept_multiple_files=True)
-
-    if not uploaded:
-        st.info("Upload one or more audio files to start.")
-        st.stop()
-
     st.markdown(
-        """
-        <div class="hud" style="padding:10px 12px; margin-top: 10px;">
-          <div class="micro">QUEUE</div>
-          <div class="sub">Files are processed in order. Outputs are bundled into one ZIP at the end.</div>
+        f"""
+        <div class="brief-note" style="margin-top:10px;">
+          <strong>First-run checklist</strong><br>
+          Supported inputs: <code>{", ".join('.' + ext for ext in SUPPORTED_TYPES)}</code>.<br>
+          Files stay local; practical size limits depend on your free disk space and RAM.<br>
+          The first run may take longer while the selected Whisper model downloads and prepares.<br>
+          ETA appears after duration probing and improves over time using local speed telemetry.
         </div>
         """,
         unsafe_allow_html=True,
     )
-
-    if "dur_cache" not in st.session_state:
-        st.session_state.dur_cache = {}
-
-    queue_rows = []
-    speakers_on = bool(enable_speakers and speakers_available and int(num_speakers) > 1)
-    rtf, samples = get_rtf(model=whisper_model, speakers=speakers_on)
-    throughput = (1.0 / float(rtf)) if (rtf and rtf > 0) else 0.0
-    eta_note = f"ETA uses learned speed (samples={samples})" if samples else "ETA uses default speed (no telemetry yet)"
-    total_audio_seconds = 0.0
-    total_eta_seconds = 0.0
-    for uf in uploaded:
-        buf = uf.getbuffer()
-        cache_key = f"{uf.name}|{len(buf)}"
-        dur = st.session_state.dur_cache.get(cache_key)
-        if dur is None:
-            try:
-                with tempfile.NamedTemporaryFile(prefix="transcriber-dur-", suffix=Path(uf.name).suffix, delete=True) as tmpf:
-                    tmpf.write(buf)
-                    tmpf.flush()
-                    dur = probe_duration_seconds(tmpf.name)
-            except Exception:
-                dur = None
-            st.session_state.dur_cache[cache_key] = dur
-
-        if dur:
-            total_audio_seconds += float(dur)
-            total_eta_seconds += float(dur) * float(rtf)
-        queue_rows.append(
-            {
-                "file": uf.name,
-                "size_mb": round(len(uf.getbuffer()) / (1024 * 1024), 2),
-                "duration": _format_duration(dur),
-                "eta": _format_eta((dur or 0.0) * float(rtf) if dur else None),
-                "status": "Queued",
-                "output": "In final ZIP",
-            }
+    if uploaded:
+        st.markdown(
+            """
+            <div class="hud" style="padding:10px 12px; margin-top: 10px;">
+              <div class="micro">QUEUE</div>
+              <div class="sub">Files are processed in order. Outputs are bundled into one ZIP at the end.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-    st.dataframe(queue_rows, use_container_width=True, hide_index=True)
-    st.caption(
-        f"Model `{whisper_model}` • Throughput ~`{throughput:.2f}x` realtime • {eta_note}. "
-        f"Estimate: `{_format_eta(total_eta_seconds)}` for `{_format_duration(total_audio_seconds)}` of audio on this machine."
-    )
 
-    start = st.button("Transcribe", type="primary", use_container_width=True)
-    if st.session_state.get("auto_transcribe"):
-        start = True
-        st.session_state["auto_transcribe"] = False
+        if "dur_cache" not in st.session_state:
+            st.session_state.dur_cache = {}
 
-    if not start:
-        st.caption("Press Transcribe when ready.")
-        st.stop()
-
-    try:
-        ensure_ffmpeg_available()
-    except RuntimeError as e:
-        st.error(str(e))
-        st.stop()
-
-    options = TranscriptionOptions(
-        whisper_model=whisper_model,
-        language=language.strip() or "en",
-        chunk_seconds=600,
-        num_speakers=int(num_speakers) if (enable_speakers and speakers_available) else None,
-        retain_audio=bool(retain_audio),
-        transcript_style=transcript_style,
-        vad=bool(vad) or bool(auto_clean),
-        normalize=bool(normalize) or bool(auto_clean),
-        denoise=bool(denoise),
-        redact=bool(redact),
-    )
-
-    with tempfile.TemporaryDirectory(prefix="transcriber-") as tmp:
-        tmp_dir = Path(tmp)
-        out_dir = tmp_dir / "out"
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        total = len(uploaded)
-        overall_bar = st.progress(0)
-        file_bar = st.progress(0)
-        status = st.empty()
-        preview = st.empty()
-        table = st.empty()
-
-        status.markdown("**Preparing model...**")
-        prep_bar = st.progress(0)
-
-        def _prep_cb(p: float, msg: str) -> None:
-            prep_bar.progress(int(max(0.0, min(1.0, float(p))) * 100))
-            if msg:
-                status.markdown(f"**Preparing model...** {msg}")
-
-        try:
-            prepare_whisper_model(options.whisper_model, progress_cb=_prep_cb)
-        except Exception as e:
-            st.error(str(e))
-            st.stop()
-        prep_bar.progress(100)
-
-        transcripts: dict[str, str] = {}
-        briefs: dict[str, dict[str, str]] = {}
-        outputs: dict[str, dict] = {}
-        status_rows = [{**r} for r in queue_rows]
-
-        for idx, uf in enumerate(uploaded, start=1):
-            status_rows[idx - 1]["status"] = "Running"
-            table.dataframe(status_rows, use_container_width=True, hide_index=True)
-
-            status.markdown(f"**File:** `{uf.name}`  \n`{idx}/{total}`")
-            file_bar.progress(0)
-            preview.text_area("Live preview", value="", height=220)
-
-            audio_path = tmp_dir / uf.name
-            audio_path.write_bytes(uf.getbuffer())
-
-            def _preview_cb(t: str) -> None:
-                preview.text_area("Live preview", value=t, height=220)
-
-            def _progress_cb(p: float, msg: str) -> None:
-                p = max(0.0, min(1.0, float(p)))
-                file_bar.progress(int(p * 100))
-                overall_p = (idx - 1 + p) / max(1, total)
-                overall_bar.progress(int(overall_p * 100))
-                if msg:
-                    status.markdown(f"**File:** `{uf.name}`  \n`{idx}/{total}` - {msg}")
-
-            try:
-                result = transcribe_file(
-                    in_path=audio_path,
-                    out_dir=out_dir,
-                    options=options,
-                    progress_cb=_progress_cb,
-                    preview_cb=_preview_cb,
-                )
-            except RuntimeError as e:
-                status_rows[idx - 1]["status"] = "Error"
-                table.dataframe(status_rows, use_container_width=True, hide_index=True)
-                st.error(str(e))
-                st.stop()
-
-            transcript_path = result.output_dir / "transcript.txt"
-            if transcript_path.exists():
-                transcripts[uf.name] = transcript_path.read_text(encoding="utf-8", errors="replace")
-
-            snippets_path = result.output_dir / "brief_snippets.json"
-            if snippets_path.exists():
+        queue_rows = []
+        speakers_on = bool(enable_speakers and speakers_available and int(num_speakers) > 1)
+        rtf, samples = get_rtf(model=whisper_model, speakers=speakers_on)
+        throughput = (1.0 / float(rtf)) if (rtf and rtf > 0) else 0.0
+        eta_note = f"ETA uses learned speed (samples={samples})" if samples else "ETA uses default speed (no telemetry yet)"
+        total_audio_seconds = 0.0
+        total_eta_seconds = 0.0
+        for uf in uploaded:
+            buf = uf.getbuffer()
+            cache_key = f"{uf.name}|{len(buf)}"
+            dur = st.session_state.dur_cache.get(cache_key)
+            if dur is None:
                 try:
-                    briefs[uf.name] = json.loads(snippets_path.read_text(encoding="utf-8"))
+                    with tempfile.NamedTemporaryFile(prefix="transcriber-dur-", suffix=Path(uf.name).suffix, delete=True) as tmpf:
+                        tmpf.write(buf)
+                        tmpf.flush()
+                        dur = probe_duration_seconds(tmpf.name)
                 except Exception:
-                    pass
+                    dur = None
+                st.session_state.dur_cache[cache_key] = dur
 
-            seg_path = result.output_dir / "segments.json"
-            segs = None
-            if seg_path.exists():
-                try:
-                    segs = json.loads(seg_path.read_text(encoding="utf-8"))
-                except Exception:
-                    segs = None
-            outputs[uf.name] = {"stem": result.output_dir.name, "segments": segs}
-
-            status_rows[idx - 1]["status"] = "Done"
-            table.dataframe(status_rows, use_container_width=True, hide_index=True)
-
-            file_bar.progress(100)
-            overall_bar.progress(int(idx / total * 100))
-
-        status.markdown("**Done.**")
-        zip_bytes = _zip_dir(out_dir)
-
-        st.session_state.last_zip_bytes = zip_bytes
-        st.session_state.last_transcripts = transcripts
-        st.session_state.last_briefs = briefs
-        st.session_state.last_outputs = outputs
-
-        st.success("Transcription complete.")
-        st.download_button(
-            label="Download transcripts (.zip)",
-            data=zip_bytes,
-            file_name="transcripts.zip",
-            mime="application/zip",
-        )
+            if dur:
+                total_audio_seconds += float(dur)
+                total_eta_seconds += float(dur) * float(rtf)
+            status_badge, next_step = _queue_status_details(status="Queued")
+            queue_rows.append(
+                {
+                    "file": uf.name,
+                    "size_mb": round(len(uf.getbuffer()) / (1024 * 1024), 2),
+                    "duration": _format_duration(dur),
+                    "eta": _format_eta((dur or 0.0) * float(rtf) if dur else None),
+                    "status": status_badge,
+                    "next_step": next_step,
+                    "warning_summary": "—",
+                    "skipped_summary": "—",
+                    "output": "In final ZIP",
+                }
+            )
+        st.dataframe(queue_rows, use_container_width=True, hide_index=True)
         st.caption(
-            "Outputs include transcript.txt (timestamps + speakers), transcript_plain.txt, segments.json, transcript.srt, transcript.vtt per file."
+            f"Model `{whisper_model}` • Throughput ~`{throughput:.2f}x` realtime • {eta_note}. "
+            f"Estimate: `{_format_eta(total_eta_seconds)}` for `{_format_duration(total_audio_seconds)}` of audio on this machine."
         )
+
+        start = st.button("Transcribe", type="primary", use_container_width=True)
+        if st.session_state.get("auto_transcribe"):
+            start = True
+            st.session_state["auto_transcribe"] = False
+
+        if not start:
+            st.caption("Press Transcribe when ready.")
+        else:
+            try:
+                ensure_ffmpeg_available()
+            except RuntimeError as e:
+                st.error(str(e))
+            else:
+                options = TranscriptionOptions(
+                    whisper_model=whisper_model,
+                    language=language.strip() or "en",
+                    chunk_seconds=600,
+                    num_speakers=int(num_speakers) if (enable_speakers and speakers_available) else None,
+                    retain_audio=bool(retain_audio),
+                    transcript_style=transcript_style,
+                    vad=bool(vad) or bool(auto_clean),
+                    normalize=bool(normalize) or bool(auto_clean),
+                    denoise=bool(denoise),
+                    redact=bool(redact),
+                )
+
+                with tempfile.TemporaryDirectory(prefix="transcriber-") as tmp:
+                    tmp_dir = Path(tmp)
+                    out_dir = tmp_dir / "out"
+                    out_dir.mkdir(parents=True, exist_ok=True)
+
+                    total = len(uploaded)
+                    overall_bar = st.progress(0)
+                    file_bar = st.progress(0)
+                    status = st.empty()
+                    preview = st.empty()
+                    table = st.empty()
+
+                    status.markdown("**Preparing model...**")
+                    prep_bar = st.progress(0)
+
+                    def _prep_cb(p: float, msg: str) -> None:
+                        prep_bar.progress(int(max(0.0, min(1.0, float(p))) * 100))
+                        if msg:
+                            status.markdown(f"**Preparing model...** {msg}")
+
+                    try:
+                        prepare_whisper_model(options.whisper_model, progress_cb=_prep_cb)
+                    except Exception as e:
+                        st.error(str(e))
+                    else:
+                        prep_bar.progress(100)
+
+                        transcripts: dict[str, str] = {}
+                        briefs: dict[str, dict[str, str]] = {}
+                        outputs: dict[str, dict] = {}
+                        status_rows = [{**r} for r in queue_rows]
+
+                        for idx, uf in enumerate(uploaded, start=1):
+                            status_rows[idx - 1]["status"], status_rows[idx - 1]["next_step"] = _queue_status_details(status="Running")
+                            table.dataframe(status_rows, use_container_width=True, hide_index=True)
+
+                            status.markdown(f"**File:** `{uf.name}`  \n`{idx}/{total}`")
+                            file_bar.progress(0)
+                            preview.text_area("Live preview", value="", height=220)
+
+                            audio_path = tmp_dir / _safe_uploaded_filename(uf.name, index=idx)
+                            audio_path.write_bytes(uf.getbuffer())
+
+                            def _preview_cb(t: str) -> None:
+                                preview.text_area("Live preview", value=t, height=220)
+
+                            def _progress_cb(p: float, msg: str) -> None:
+                                p = max(0.0, min(1.0, float(p)))
+                                file_bar.progress(int(p * 100))
+                                overall_p = (idx - 1 + p) / max(1, total)
+                                overall_bar.progress(int(overall_p * 100))
+                                if msg:
+                                    status.markdown(f"**File:** `{uf.name}`  \n`{idx}/{total}` - {msg}")
+
+                            try:
+                                result = transcribe_file(
+                                    in_path=audio_path,
+                                    out_dir=out_dir,
+                                    options=options,
+                                    progress_cb=_progress_cb,
+                                    preview_cb=_preview_cb,
+                                )
+                            except RuntimeError as e:
+                                status_rows[idx - 1]["status"], status_rows[idx - 1]["next_step"] = _queue_status_details(
+                                    status="Error", error_message=str(e)
+                                )
+                                status_rows[idx - 1]["output"] = "Not written"
+                                table.dataframe(status_rows, use_container_width=True, hide_index=True)
+                                st.error(str(e))
+                                break
+
+                            transcript_path = result.output_dir / "transcript.txt"
+                            if transcript_path.exists():
+                                transcripts[uf.name] = transcript_path.read_text(encoding="utf-8", errors="replace")
+
+                            snippets_path = result.output_dir / "brief_snippets.json"
+                            if snippets_path.exists():
+                                try:
+                                    briefs[uf.name] = json.loads(snippets_path.read_text(encoding="utf-8"))
+                                except Exception:
+                                    pass
+
+                            seg_path = result.output_dir / "segments.json"
+                            segs = None
+                            if seg_path.exists():
+                                try:
+                                    segs = json.loads(seg_path.read_text(encoding="utf-8"))
+                                except Exception:
+                                    segs = None
+                            output_meta = _load_output_meta(result.output_dir)
+                            status_rows[idx - 1]["warning_summary"] = output_meta["warning_summary"]
+                            status_rows[idx - 1]["skipped_summary"] = output_meta["skipped_summary"]
+                            status_rows[idx - 1]["status"], status_rows[idx - 1]["next_step"] = _queue_status_details(
+                                status="Done", output_meta=output_meta
+                            )
+                            status_rows[idx - 1]["output"] = result.output_dir.name
+                            outputs[uf.name] = {
+                                "stem": result.output_dir.name,
+                                "segments": segs,
+                                "meta": output_meta,
+                            }
+
+                            table.dataframe(status_rows, use_container_width=True, hide_index=True)
+
+                            file_bar.progress(100)
+                            overall_bar.progress(int(idx / total * 100))
+                        else:
+                            # Runs only if every file completed without hitting the RuntimeError break above.
+                            status.markdown("**Done.**")
+                            zip_bytes = _zip_dir(out_dir)
+
+                            st.session_state.last_zip_bytes = zip_bytes
+                            st.session_state.last_transcripts = transcripts
+                            st.session_state.last_briefs = briefs
+                            st.session_state.last_outputs = outputs
+
+                            st.success("Transcription complete.")
+                            st.download_button(
+                                label="Download transcripts (.zip)",
+                                data=zip_bytes,
+                                file_name="transcripts.zip",
+                                mime="application/zip",
+                            )
+                            st.caption(
+                                "Outputs include transcript.txt (timestamps + speakers), transcript_plain.txt, segments.json, transcript.srt, transcript.vtt per file."
+                            )
+    else:
+        st.info("Upload one or more audio files to start.")
+        st.caption("You can still use the Hot folder and Transcript tabs without uploading first.")
 
 with tabs[1]:
     st.markdown(
@@ -793,10 +1162,16 @@ with tabs[1]:
         unsafe_allow_html=True,
     )
 
-    folder = st.text_input("Folder to watch", value="", placeholder=r"C:\path\to\folder")
-    out_dir = st.text_input("Output folder", value="", placeholder=r"(default: <folder>\\_transcripts)")
+    folder_example, out_example = _hotfolder_placeholders()
+    folder = st.text_input("Folder to watch", value="", placeholder=folder_example)
+    out_dir = st.text_input("Output folder", value="", placeholder=out_example)
     recursive = st.checkbox("Include subfolders", value=True)
-    use_hash = st.checkbox("Safer de-dupe (SHA256 hashing, slower)", value=False)
+    use_hash = st.checkbox("Hash changed files before skip (safer, slower)", value=False)
+    always_hash_before_skip = st.checkbox("Always hash before skip (correctness-first, slowest)", value=False)
+    st.caption(f"Examples: watch `{folder_example}` • output `{out_example}`")
+    st.caption(
+        "Default de-duplication skips files by size + modified time. Hash modes add extra disk I/O but catch copied/replaced-file edge cases more reliably."
+    )
 
     hotfolder_deps = bool(importlib.util.find_spec("watchdog"))
     if not hotfolder_deps:
@@ -817,121 +1192,147 @@ with tabs[1]:
     else:
         out_dir_path = Path(out_dir).expanduser() if out_dir.strip() else None
 
+    if folder_path:
+        st.caption(f"Watch folder resolves to `{folder_path.resolve(strict=False)}`")
+    if out_dir_path:
+        st.caption(f"Output folder resolves to `{out_dir_path.resolve(strict=False)}`")
+
     if scan_now:
         if not folder_path or not folder_path.exists() or not folder_path.is_dir():
-            st.error("Pick an existing folder.")
-            st.stop()
-        if not out_dir_path:
-            st.error("Pick an output folder.")
-            st.stop()
-
-        out_dir_path.mkdir(parents=True, exist_ok=True)
-        state = load_state(out_dir_path)
-        files = iter_audio_files(folder_path, recursive=bool(recursive))
-        new_files: list[Path] = []
-        for f in files:
-            key = rel_key(folder_path, f)
-            sig = stat_signature(f)
-            prev = state.get(key)
-            if prev and prev.size == sig.size and prev.mtime_ns == sig.mtime_ns and (not use_hash or prev.sha256):
-                continue
-            new_files.append(f)
-
-        st.write(f"Found {len(files)} audio file(s). New/changed: {len(new_files)}.")
-        if not new_files:
-            st.stop()
-
-        try:
-            ensure_ffmpeg_available()
-        except RuntimeError as e:
-            st.error(str(e))
-            st.stop()
-
-        options = TranscriptionOptions(
-            whisper_model=whisper_model,
-            language=(language.strip() or "en"),
-            chunk_seconds=600,
-            num_speakers=int(num_speakers) if (enable_speakers and speakers_available) else None,
-            retain_audio=bool(retain_audio),
-            transcript_style=transcript_style,
-            vad=bool(vad) or bool(auto_clean),
-            normalize=bool(normalize) or bool(auto_clean),
-            denoise=bool(denoise),
-            redact=bool(redact),
-        )
-        prepare_whisper_model(options.whisper_model, progress_cb=None)
-
-        bar = st.progress(0)
-        status = st.empty()
-        for i, f in enumerate(new_files, start=1):
-            status.markdown(f"**Transcribing:** `{f.name}` (`{i}/{len(new_files)}`)")
-            try:
-                transcribe_file(in_path=f, out_dir=out_dir_path, options=options, progress_cb=None, preview_cb=None)
-                sig = stat_signature(f)
+            detail = f" Current value resolves to `{folder_path.resolve(strict=False)}`." if folder_path else ""
+            st.error(f"Pick an existing folder.{detail}")
+        elif not out_dir_path:
+            st.error("Pick an output folder. Leave it blank to use the default `_transcripts` folder.")
+        else:
+            out_dir_path.mkdir(parents=True, exist_ok=True)
+            state = load_state(out_dir_path)
+            files = iter_audio_files(folder_path, recursive=bool(recursive))
+            new_files: list[Path] = []
+            state_dirty = False
+            for f in files:
                 key = rel_key(folder_path, f)
-                sha = sha256_file(f) if use_hash else None
-                state[key] = FileSignature(size=sig.size, mtime_ns=sig.mtime_ns, sha256=sha)
+                decision = decide_file_action(
+                    f,
+                    state.get(key),
+                    use_hash=bool(use_hash),
+                    always_hash_before_skip=bool(always_hash_before_skip),
+                )
+                if not decision.should_process:
+                    if decision.persist_state:
+                        state[key] = decision.signature
+                        state_dirty = True
+                    continue
+                new_files.append(f)
+
+            if state_dirty:
                 save_state(out_dir_path, state)
-            except Exception as e:
-                st.error(f"{f.name}: {e}")
-            bar.progress(int(i / len(new_files) * 100))
-        st.success("Hot-folder scan complete.")
+
+            st.write(f"Found {len(files)} audio file(s). New/changed: {len(new_files)}. Output: `{out_dir_path.resolve(strict=False)}`.")
+            if not new_files:
+                st.info("No new or changed audio files were found for this hot-folder run.")
+            else:
+                try:
+                    ensure_ffmpeg_available()
+                except RuntimeError as e:
+                    st.error(str(e))
+                else:
+                    options = TranscriptionOptions(
+                        whisper_model=whisper_model,
+                        language=(language.strip() or "en"),
+                        chunk_seconds=600,
+                        num_speakers=int(num_speakers) if (enable_speakers and speakers_available) else None,
+                        retain_audio=bool(retain_audio),
+                        transcript_style=transcript_style,
+                        vad=bool(vad) or bool(auto_clean),
+                        normalize=bool(normalize) or bool(auto_clean),
+                        denoise=bool(denoise),
+                        redact=bool(redact),
+                    )
+                    prepare_whisper_model(options.whisper_model, progress_cb=None)
+
+                    bar = st.progress(0)
+                    status = st.empty()
+                    for i, f in enumerate(new_files, start=1):
+                        status.markdown(f"**Transcribing:** `{f.name}` (`{i}/{len(new_files)}`)")
+                        try:
+                            key = rel_key(folder_path, f)
+                            decision = decide_file_action(
+                                f,
+                                state.get(key),
+                                use_hash=bool(use_hash),
+                                always_hash_before_skip=bool(always_hash_before_skip),
+                            )
+                            if not decision.should_process:
+                                if decision.persist_state:
+                                    state[key] = decision.signature
+                                    save_state(out_dir_path, state)
+                                continue
+                            transcribe_file(in_path=f, out_dir=out_dir_path, options=options, progress_cb=None, preview_cb=None)
+                            state[key] = decision.signature
+                            save_state(out_dir_path, state)
+                        except Exception:
+                            st.error(
+                                f"Failed to transcribe `{f.name}`. Check dependencies, output-folder access, "
+                                "or settings, then retry."
+                            )
+                        bar.progress(int(i / len(new_files) * 100))
+                    st.success("Hot-folder scan complete.")
 
     if start_watch:
         if not folder_path or not folder_path.exists() or not folder_path.is_dir():
-            st.error("Pick an existing folder.")
-            st.stop()
-        if not out_dir_path:
-            st.error("Pick an output folder.")
-            st.stop()
+            detail = f" Current value resolves to `{folder_path.resolve(strict=False)}`." if folder_path else ""
+            st.error(f"Pick an existing folder.{detail}")
+        elif not out_dir_path:
+            st.error("Pick an output folder. Leave it blank to use the default `_transcripts` folder.")
+        else:
+            proc = st.session_state.hotfolder_proc
+            if proc is not None and proc.poll() is None:
+                st.info("Watcher already running.")
+            else:
+                logs_dir = Path(__file__).parent / "logs"
+                logs_dir.mkdir(parents=True, exist_ok=True)
+                log_path = logs_dir / "hotfolder_watch.log"
 
-        proc = st.session_state.hotfolder_proc
-        if proc is not None and proc.poll() is None:
-            st.info("Watcher already running.")
-            st.stop()
+                cmd = [
+                    sys.executable,
+                    os.fspath(Path(__file__).parent / "watch_hotfolder.py"),
+                    "--folder",
+                    os.fspath(folder_path),
+                    "--out",
+                    os.fspath(out_dir_path),
+                    "--model",
+                    whisper_model,
+                    "--language",
+                    (language.strip() or "en"),
+                ]
+                if recursive:
+                    cmd.append("--recursive")
+                if use_hash:
+                    cmd.append("--hash")
+                if always_hash_before_skip:
+                    cmd.append("--always-hash-before-skip")
+                if enable_speakers and speakers_available:
+                    cmd += ["--speakers", str(int(num_speakers))]
+                cmd += ["--style", transcript_style]
+                if bool(vad) or bool(auto_clean):
+                    cmd.append("--vad")
+                if bool(normalize) or bool(auto_clean):
+                    cmd.append("--normalize")
+                if bool(denoise):
+                    cmd.append("--denoise")
+                if bool(redact):
+                    cmd.append("--redact")
 
-        logs_dir = Path(__file__).parent / "logs"
-        logs_dir.mkdir(parents=True, exist_ok=True)
-        log_path = logs_dir / "hotfolder_watch.log"
-
-        cmd = [
-            sys.executable,
-            os.fspath(Path(__file__).parent / "watch_hotfolder.py"),
-            "--folder",
-            os.fspath(folder_path),
-            "--out",
-            os.fspath(out_dir_path),
-            "--model",
-            whisper_model,
-            "--language",
-            (language.strip() or "en"),
-        ]
-        if recursive:
-            cmd.append("--recursive")
-        if use_hash:
-            cmd.append("--hash")
-        if enable_speakers and speakers_available:
-            cmd += ["--speakers", str(int(num_speakers))]
-        cmd += ["--style", transcript_style]
-        if bool(vad) or bool(auto_clean):
-            cmd.append("--vad")
-        if bool(normalize) or bool(auto_clean):
-            cmd.append("--normalize")
-        if bool(denoise):
-            cmd.append("--denoise")
-        if bool(redact):
-            cmd.append("--redact")
-
-        lf = log_path.open("a", encoding="utf-8")
-        lf.write("\n--- START watcher ---\n")
-        lf.flush()
-        st.session_state.hotfolder_proc = subprocess.Popen(
-            cmd,
-            stdout=lf,
-            stderr=subprocess.STDOUT,
-            cwd=Path(__file__).parent,
-        )
-        st.success("Watcher started. Leave this tab open to monitor logs.")
+                lf = log_path.open("a", encoding="utf-8")
+                lf.write("\n--- START watcher ---\n")
+                lf.flush()
+                st.session_state.hotfolder_proc = subprocess.Popen(
+                    cmd,
+                    stdout=lf,
+                    stderr=subprocess.STDOUT,
+                    cwd=Path(__file__).parent,
+                )
+                st.success(f"Watcher started. Outputs go to `{out_dir_path.resolve(strict=False)}`. Leave this tab open to monitor logs.")
 
     if stop_watch:
         proc = st.session_state.hotfolder_proc
@@ -957,45 +1358,118 @@ with tabs[2]:
         """
         <div class="hud" style="padding:10px 12px; margin-top: 6px;">
           <div class="micro">TRANSCRIPT VIEW</div>
-          <div class="sub">Search and skim. Download the ZIP from the Transcribe tab.</div>
+          <div class="sub">Search and skim. You can also reopen a saved transcript ZIP or output folder.</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+    load_zip = st.file_uploader("Load saved transcript ZIP", type=["zip"], key="load_saved_zip")
+    load_folder = st.text_input(
+        "Or load saved transcript folder",
+        value="",
+        placeholder="/path/to/_transcripts",
+        key="load_saved_folder",
+    )
+    load_existing = st.button("Load saved outputs", use_container_width=True)
+
+    if load_existing:
+        try:
+            if load_zip is not None:
+                transcripts, briefs, outputs, zip_bytes = _load_saved_outputs_from_zip_bytes(load_zip.getvalue())
+            elif load_folder.strip():
+                load_root = _validated_saved_output_dir(load_folder)
+                transcripts, briefs, outputs, zip_bytes = _load_saved_outputs_from_dir(load_root)
+            else:
+                raise RuntimeError("Choose a transcript ZIP or an output folder first.")
+
+            if not transcripts:
+                raise RuntimeError("No transcript outputs were found in the selected ZIP/folder.")
+
+            st.session_state.last_transcripts = transcripts
+            st.session_state.last_briefs = briefs
+            st.session_state.last_outputs = outputs
+            st.session_state.last_zip_bytes = zip_bytes
+            st.success(f"Loaded {len(transcripts)} transcript output(s).")
+        except Exception:
+            st.error(
+                "Could not load saved outputs. Verify the path or ZIP is correct and that it contains valid transcript files."
+            )
 
     transcripts: dict[str, str] = st.session_state.get("last_transcripts") or {}
     outputs: dict[str, dict] = st.session_state.get("last_outputs") or {}
-    if not transcripts:
-        st.info("No transcript yet. Run a transcription first.")
-        st.stop()
-
-    files = sorted(transcripts.keys())
-    selected = st.selectbox("File", files, index=0, key="sel_file")
-
-    text = transcripts.get(selected, "")
+    selected = ""
+    text = ""
     briefs: dict[str, dict[str, str]] = st.session_state.get("last_briefs") or {}
-    segs = (outputs.get(selected) or {}).get("segments") or []
-    stem = (outputs.get(selected) or {}).get("stem")
-    query = st.text_input("Search", value="", placeholder="Search segments...", key="seg_query")
-
-    # Playback sync (best-effort).
-    zip_bytes = st.session_state.get("last_zip_bytes")
+    segs: list[dict] = []
+    stem = None
+    output_meta: dict = {}
+    query = ""
     audio_bytes: bytes | None = None
     audio_mime: str | None = None
-    if zip_bytes and stem:
-        try:
-            with zipfile.ZipFile(io.BytesIO(zip_bytes), mode="r") as zf:
-                for cand, mime in ((f"{stem}/audio_preview.mp3", "audio/mpeg"), (f"{stem}/audio.wav", "audio/wav")):
-                    try:
-                        audio_bytes = zf.read(cand)
-                        audio_mime = mime
-                        break
-                    except Exception:
-                        continue
-        except Exception:
-            audio_bytes = None
+    if not transcripts:
+        st.info("No transcript loaded yet. Run a transcription first, or load a saved ZIP/folder above.")
+    else:
+        files = sorted(transcripts.keys())
+        selected = st.selectbox("File", files, index=0, key="sel_file")
 
-    if audio_bytes:
+        text = transcripts.get(selected, "")
+        briefs = st.session_state.get("last_briefs") or {}
+        segs = (outputs.get(selected) or {}).get("segments") or []
+        stem = (outputs.get(selected) or {}).get("stem")
+        output_meta = (outputs.get(selected) or {}).get("meta") or {}
+        query = st.text_input("Search", value="", placeholder="Search segments...", key="seg_query")
+
+        warnings = output_meta.get("warnings") or []
+        skipped_total = int(output_meta.get("skipped_total") or 0)
+        skipped_vad = int(output_meta.get("skipped_vad_empty") or 0)
+        skipped_quiet = int(output_meta.get("skipped_quiet") or 0)
+        with st.expander("Diagnostics", expanded=False):
+            st.write(
+                {
+                    "warning_summary": output_meta.get("warning_summary"),
+                    "skipped_summary": output_meta.get("skipped_summary"),
+                    "preflight": output_meta.get("preflight") or {},
+                    "run_stats": output_meta.get("run_stats") or {},
+                    "diarization": output_meta.get("diarization") or {},
+                }
+            )
+        if warnings or skipped_total:
+            st.markdown(
+                """
+                <div class="hud" style="padding:10px 12px; margin-top: 10px;">
+                  <div class="micro">FILE WARNINGS</div>
+                  <div class="sub">Preflight and non-fatal processing notices for the selected file.</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            for warning in warnings:
+                st.warning(warning)
+            if skipped_total:
+                detail_parts = []
+                if skipped_vad:
+                    detail_parts.append(f"{skipped_vad} VAD-trimmed empty")
+                if skipped_quiet:
+                    detail_parts.append(f"{skipped_quiet} ultra-quiet")
+                detail_txt = f" ({', '.join(detail_parts)})" if detail_parts else ""
+                st.info(f"Skipped chunks: {skipped_total}{detail_txt}.")
+
+        # Playback sync (best-effort).
+        zip_bytes = st.session_state.get("last_zip_bytes")
+        if zip_bytes and stem:
+            try:
+                with zipfile.ZipFile(io.BytesIO(zip_bytes), mode="r") as zf:
+                    for cand, mime in ((f"{stem}/audio_preview.mp3", "audio/mpeg"), (f"{stem}/audio.wav", "audio/wav")):
+                        try:
+                            audio_bytes = zf.read(cand)
+                            audio_mime = mime
+                            break
+                        except Exception:
+                            continue
+            except Exception:
+                audio_bytes = None
+
+    if transcripts and audio_bytes:
         # Data URI approach enables click-to-jump timestamps.
         max_embed = 12 * 1024 * 1024
         if len(audio_bytes) <= max_embed:
@@ -1034,9 +1508,11 @@ with tabs[2]:
                 unsafe_allow_html=True,
             )
             st.audio(audio_bytes)
+    elif transcripts:
+        st.caption("Playback preview is unavailable for this result set. Load the ZIP output to restore bundled audio artifacts.")
 
     # Segment-first transcript view (uses segments.json metadata).
-    if segs:
+    if transcripts and segs:
         st.markdown(
             """
             <div class="hud" style="padding:10px 12px; margin-top: 10px;">
@@ -1046,6 +1522,38 @@ with tabs[2]:
             """,
             unsafe_allow_html=True,
         )
+        st.markdown(
+            """
+            <div class="conf-legend">
+              <span class="conf-chip low"><span class="dot"></span>Low confidence</span>
+              <span class="conf-chip mid"><span class="dot"></span>Review</span>
+              <span class="conf-chip good"><span class="dot"></span>Stronger match</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.caption("Confidence is estimated from Whisper metadata (avg_logprob, no_speech_prob, compression_ratio).")
+        diarization_meta = output_meta.get("diarization") or {}
+        diarization_metrics = diarization_meta.get("metrics") if isinstance(diarization_meta, dict) else {}
+        diarization_parts: list[str] = []
+        if isinstance(diarization_meta, dict):
+            diar_count = diarization_meta.get("num_speakers")
+            if diar_count:
+                diarization_parts.append(f"configured speakers: {int(diar_count)}")
+        if isinstance(diarization_metrics, dict):
+            if diarization_metrics.get("n_windows") is not None:
+                diarization_parts.append(f"windows: {int(diarization_metrics.get('n_windows') or 0)}")
+            if diarization_metrics.get("silhouette") is not None:
+                diarization_parts.append(f"silhouette: {float(diarization_metrics.get('silhouette') or 0.0):.2f}")
+            if diarization_metrics.get("inertia") is not None:
+                diarization_parts.append(f"inertia: {float(diarization_metrics.get('inertia') or 0.0):.2f}")
+        if diarization_parts:
+            st.caption(
+                "Speaker labels use optional KMeans-based diarization. "
+                + " • ".join(diarization_parts)
+                + "."
+            )
+        st.caption("Speaker match badges are heuristic: High ≥ 0.75, Medium ≥ 0.45, Low < 0.45.")
 
         def _conf_score(s: dict) -> float:
             w = s.get("whisper") or {}
@@ -1123,21 +1631,29 @@ with tabs[2]:
             cls = "good"
             if sc < float(low_threshold):
                 cls = "low"
+                conf_label = "Low confidence"
             elif sc < float(low_threshold) + 0.15:
                 cls = "mid"
+                conf_label = "Review"
+            else:
+                conf_label = "Stronger match"
 
             spk_conf = s.get("speaker_confidence")
-            spk_conf_txt = ""
+            spk_badge_html = ""
             try:
                 if spk_conf is not None:
-                    spk_conf_txt = f" • spk {float(spk_conf):.2f}"
+                    spk_label, spk_css, spk_title = _speaker_confidence_badge(float(spk_conf))
+                    spk_badge_html = (
+                        f' <span class="conf-chip {spk_css}" title="{_html.escape(spk_title)}">'
+                        f'<span class="dot"></span>{_html.escape(spk_label)}</span>'
+                    )
             except Exception:
-                spk_conf_txt = ""
+                spk_badge_html = ""
 
             blocks.append(
                 f"""
                 <div class="seg {cls}" onclick="window.__transcriber_jump && window.__transcriber_jump({start:.3f});">
-                  <div class="seg-h">{_html.escape(_format_duration(start))} <span class="spk">{_html.escape(spk)}</span> <span class="sc">{sc:.2f}{_html.escape(spk_conf_txt)}</span></div>
+                  <div class="seg-h">{_html.escape(_format_duration(start))} <span class="spk">{_html.escape(spk)}</span> <span class="conf-chip {cls}"><span class="dot"></span>{_html.escape(conf_label)}</span>{spk_badge_html} <span class="sc">{sc:.2f}</span></div>
                   <div class="seg-t">{_html.escape(txt)}</div>
                 </div>
                 """
@@ -1153,12 +1669,12 @@ with tabs[2]:
               .seg{ cursor: pointer; transition: transform .08s ease, box-shadow .12s ease; }
               .seg:hover{ transform: translateY(-1px); box-shadow: 0 18px 40px rgba(0,0,0,0.22); }
               .seg-h{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-                      color: rgba(236,243,255,0.82); letter-spacing: .10em; text-transform: uppercase; font-size: .75rem; display:flex; gap:10px; align-items:center; }
+                      color: rgba(236,243,255,0.82); letter-spacing: .05em; font-size: .75rem; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
               .seg-h .spk{ color: rgba(167,240,255,0.95); }
               .seg-h .sc{ margin-left:auto; color: rgba(185,212,255,0.85); }
               .seg-t{ margin-top:6px; color: rgba(236,243,255,0.92); }
-              .seg.low{ border-color: rgba(255, 96, 136, 0.45); box-shadow: 0 0 24px rgba(255, 96, 136, 0.12); }
-              .seg.mid{ border-color: rgba(255, 210, 107, 0.40); box-shadow: 0 0 24px rgba(255, 210, 107, 0.10); }
+              .seg.low{ border-color: rgba(255, 96, 136, 0.35); }
+              .seg.mid{ border-color: rgba(255, 210, 107, 0.30); }
               .seg.good{ border-color: rgba(167,240,255,0.16); }
             </style>
             """,
@@ -1177,7 +1693,7 @@ with tabs[2]:
                 st.text_area("Transcript (filtered)", value=filtered, height=360)
             else:
                 st.text_area("Transcript", value=text, height=360)
-    else:
+    elif transcripts:
         # Fallback if segments.json isn't available.
         if query.strip():
             q = query.strip().lower()
@@ -1187,7 +1703,7 @@ with tabs[2]:
             st.text_area("Transcript", value=text, height=420)
 
     brief = briefs.get(selected)
-    if brief:
+    if transcripts and brief:
         if st.session_state.get("focus_brief"):
             st.session_state["focus_brief"] = False
             try:
@@ -1198,7 +1714,17 @@ with tabs[2]:
             """
             <div class="hud" style="padding:10px 12px; margin-top: 10px;">
               <div class="micro">BRIEF PACK</div>
-              <div class="sub">Copy/paste for leadership or ops channels.</div>
+              <div class="sub">Copy/paste outputs plus heuristic highlights from the generated brief.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            """
+            <div class="brief-note">
+              Heuristic highlights in <code>brief.md</code> and <code>brief.html</code> are chosen automatically.
+              The picker favors longer, higher-confidence, information-dense moments (for example numbers, questions, and named entities)
+              while spreading selections across the timeline.
             </div>
             """,
             unsafe_allow_html=True,
@@ -1206,40 +1732,8 @@ with tabs[2]:
 
         email_txt = str(brief.get("email") or "").strip()
         wa_txt = str(brief.get("whatsapp") or "").strip()
-
-        def _copy_widget(key: str, label: str, value: str) -> None:
-            display = _html.escape(value)
-            js = (
-                value.replace("\\", "\\\\")
-                .replace("`", "\\`")
-                .replace("${", "\\${")
-                .replace("</script", "<\\/script")
-            )
-            st.markdown(
-                f"""
-                <div style="margin-top:10px;">
-                  <div class="micro" style="margin-bottom:6px;">{label}</div>
-                  <button id="{key}_btn" style="width:100%; padding:10px 12px; border-radius:14px; border:1px solid rgba(167,240,255,0.18); background: rgba(255,255,255,0.06); color: rgba(236,243,255,0.92); letter-spacing:0.06em; text-transform:uppercase;">
-                    Copy
-                  </button>
-                  <pre id="{key}_txt" style="white-space:pre-wrap; word-break:break-word; margin-top:10px; background: rgba(0,0,0,0.18); border:1px solid rgba(167,240,255,0.14); border-radius:14px; padding:12px 12px; color: rgba(236,243,255,0.92);">{display}</pre>
-                </div>
-                <script>
-                  (function(){{
-                    const btn = document.getElementById("{key}_btn");
-                    const txt = `{js}`;
-                    if(btn) btn.onclick = async () => {{
-                      try {{ await navigator.clipboard.writeText(txt); btn.textContent = "Copied"; setTimeout(()=>btn.textContent="Copy", 900); }}
-                      catch(e) {{ btn.textContent = "Copy failed"; setTimeout(()=>btn.textContent="Copy", 1200); }}
-                    }};
-                  }})();
-                </script>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        _copy_widget(f"email_{selected}".replace(".", "_"), "Email-ready", email_txt)
-        _copy_widget(f"wa_{selected}".replace(".", "_"), "WhatsApp-ready", wa_txt)
+        _copy_text_widget(key=f"email_{selected}".replace(".", "_"), label="Email-ready", value=email_txt)
+        _copy_text_widget(key=f"wa_{selected}".replace(".", "_"), label="WhatsApp-ready", value=wa_txt)
 
         # Link to brief.html if present in the ZIP output
         st.caption("Also saved per file as `brief.md` and `brief.html` inside the output ZIP.")

@@ -1,6 +1,18 @@
 # TRANSCRIBER
 
-TRANSCRIBER is a local Windows-friendly app for turning audio and video files into transcripts. It runs Whisper on your computer, so your files are not uploaded to a cloud transcription service.
+TRANSCRIBER is a local app for turning audio and video files into transcripts. It runs Whisper on your computer, so your files are not uploaded to a cloud transcription service. The app presents itself as a local/private transcription console with a sober dark-blue interface.
+
+No environment variables are required for standard local use.
+
+## Supported platforms
+
+- Windows 10/11
+- macOS
+- Linux
+
+## UI preview
+
+![TRANSCRIBER UI preview](assets/mp3_transcriber.png)
 
 ## For Normal Use
 
@@ -36,6 +48,7 @@ Supported inputs include `.mp3`, `.m4a`, `.mp4`, `.aac`, `.wav`, `.flac`, `.ogg`
 ## Optional Features
 
 Speaker labels are beta. On Windows, run `Setup-Speakers.cmd` after `Setup.cmd`, then relaunch the app.
+They are implemented as optional speaker diarization with speech embeddings plus KMeans-based labeling. This is not an identity graph, entity stitching, or person-recognition system.
 
 Hot-folder watching is available from the app. If the app says the watcher dependency is missing, install it with:
 
@@ -43,9 +56,106 @@ Hot-folder watching is available from the app. If the app says the watcher depen
 .\.venv\Scripts\python.exe -m pip install -r requirements-hotfolder.txt
 ```
 
+## Privacy and local telemetry
+
+TRANSCRIBER stores a small local telemetry file only to improve ETA estimates on your own machine.
+
+- Windows: `%LOCALAPPDATA%\transcriber\telemetry.json`
+- macOS / Linux: `~/.cache/transcriber/telemetry.json`
+
+The file stores only per-configuration speed profiles:
+
+- model name
+- whether speaker labeling was enabled
+- learned real-time factor (`rtf`)
+- sample count used for the moving average
+
+It does **not** store transcript text, audio, speaker names, identities, or remote analytics. The file stays on the local machine unless you copy it yourself.
+
+## Install from source
+
+### Windows
+
+Prerequisites:
+
+- Python 3
+
+Run from the `app/` directory:
+
+```powershell
+.\Setup.cmd
+.\Launch.cmd
+```
+
+Optional LAN launch:
+
+```powershell
+.\Launch-LAN.cmd
+```
+
+### macOS
+
+Prerequisites:
+
+```bash
+brew install python ffmpeg
+```
+
+Run from the `app/` directory:
+
+```bash
+bash ./setup_unix.sh
+```
+
+### Ubuntu / Debian Linux
+
+Prerequisites:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv ffmpeg
+```
+
+Run from the `app/` directory:
+
+```bash
+bash ./setup_unix.sh
+```
+
+If `setup_unix.sh` stops with an error, fix the missing prerequisite shown in the terminal and rerun the same command.
+
+## Supported pip install path
+
+If you are installing from source instead of using the launcher scripts, the supported package install path is:
+
+```bash
+python -m pip install .
+```
+
+Optional extras:
+
+```bash
+python -m pip install .[hotfolder]
+python -m pip install .[speakers]
+```
+
+First successful run confirmation on macOS/Linux:
+
+```bash
+curl -s http://127.0.0.1:8501/_stcore/health
+```
+
+Expected output:
+
+```text
+ok
+```
+
 ## Manual Run
 
 Use this if you are developing the project or running it outside the Windows launchers.
+
+### Windows PowerShell
 
 ```powershell
 python -m venv .venv
@@ -55,7 +165,17 @@ python -m pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-On macOS/Linux, install FFmpeg first, then use `setup_unix.sh` or create a virtual environment manually.
+### macOS / Linux
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+Install FFmpeg before the first run.
 
 ## Command Line
 

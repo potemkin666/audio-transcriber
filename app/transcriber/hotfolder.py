@@ -18,6 +18,13 @@ class FileSignature:
     sha256: str | None = None
 
 
+@dataclass(frozen=True)
+class FileDecision:
+    should_process: bool
+    signature: FileSignature
+    persist_state: bool = False
+
+
 def _state_path(out_dir: Path) -> Path:
     return out_dir / ".transcriber_hotfolder_state.json"
 
@@ -80,6 +87,51 @@ def sha256_file(p: Path, *, chunk_size: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
+def decide_file_action(
+    p: Path,
+    previous: FileSignature | None,
+    *,
+    use_hash: bool,
+    always_hash_before_skip: bool = False,
+) -> FileDecision:
+    """
+    Decide whether a hot-folder file should be processed.
+
+    When always_hash_before_skip is enabled, every candidate file is hashed
+    before deciding whether to skip it. This is the most correctness-focused
+    mode, but it adds extra disk I/O even for unchanged files.
+    """
+    sig = stat_signature(p)
+    same_meta = bool(previous and previous.size == sig.size and previous.mtime_ns == sig.mtime_ns)
+
+    if always_hash_before_skip:
+        sha = sha256_file(p)
+        current = FileSignature(size=sig.size, mtime_ns=sig.mtime_ns, sha256=sha)
+        if previous is None:
+            return FileDecision(should_process=True, signature=current)
+        if previous.sha256 and previous.sha256 == sha:
+            return FileDecision(should_process=False, signature=current, persist_state=True)
+        return FileDecision(should_process=True, signature=current)
+
+    if previous is None:
+        return FileDecision(should_process=True, signature=sig)
+
+    if not use_hash:
+        return FileDecision(should_process=not same_meta, signature=sig)
+
+    if same_meta and previous.sha256:
+        return FileDecision(
+            should_process=False,
+            signature=FileSignature(size=sig.size, mtime_ns=sig.mtime_ns, sha256=previous.sha256),
+        )
+
+    sha = sha256_file(p)
+    current = FileSignature(size=sig.size, mtime_ns=sig.mtime_ns, sha256=sha)
+    if previous.sha256 and previous.sha256 == sha:
+        return FileDecision(should_process=False, signature=current, persist_state=True)
+    return FileDecision(should_process=True, signature=current)
+
+
 def is_settled(p: Path, *, wait_seconds: float = 1.0, checks: int = 3) -> bool:
     """
     Files dropped into a hot folder may still be copying.
@@ -105,4 +157,3 @@ def rel_key(folder: Path, p: Path) -> str:
         return os.fspath(p.resolve().relative_to(folder.resolve()))
     except Exception:
         return os.fspath(p.resolve())
-

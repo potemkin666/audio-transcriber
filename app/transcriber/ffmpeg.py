@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import platform
 import shutil
 import subprocess
 import json
@@ -7,7 +9,7 @@ from pathlib import Path
 
 
 def _project_root() -> Path:
-    # .../mp3-transcriber/transcriber/ffmpeg.py -> project root
+    # .../audio-transcriber/app/transcriber/ffmpeg.py -> project root
     return Path(__file__).resolve().parents[1]
 
 
@@ -29,14 +31,30 @@ def _find_ffmpeg_exe(name: str) -> str | None:
     return None
 
 
+def _ffmpeg_install_hint() -> str:
+    system = platform.system().lower()
+    if system == "windows":
+        return "Run Setup.cmd to auto-download it, or install it system-wide with: winget install Gyan.FFmpeg."
+    if system == "darwin":
+        return "Install it with Homebrew: brew install ffmpeg."
+    if system == "linux":
+        if shutil.which("apt-get"):
+            return "Install it with: sudo apt-get update && sudo apt-get install -y ffmpeg."
+        return "Install it with your package manager, for example: brew install ffmpeg or sudo apt-get install -y ffmpeg."
+    return "Install it system-wide and make sure both ffmpeg and ffprobe are on PATH."
+
+
 def ensure_ffmpeg_available() -> None:
     ffmpeg = _find_ffmpeg_exe("ffmpeg")
     ffprobe = _find_ffmpeg_exe("ffprobe")
     if not ffmpeg or not ffprobe:
-        raise RuntimeError(
-            "FFmpeg is required but wasn't found on PATH. "
-            "Run Setup.cmd to auto-download it, or install it system-wide with: winget install Gyan.FFmpeg."
-        )
+        missing = []
+        if not ffmpeg:
+            missing.append("ffmpeg")
+        if not ffprobe:
+            missing.append("ffprobe")
+        missing_txt = " and ".join(missing) if missing else "ffmpeg/ffprobe"
+        raise RuntimeError(f"FFmpeg is required but {missing_txt} wasn't found on PATH. {_ffmpeg_install_hint()}")
 
     # Light sanity check (fast).
     subprocess.run([ffmpeg, "-version"], check=True, capture_output=True)
@@ -174,7 +192,6 @@ def split_to_wav_chunks(
     subprocess.run(cmd, check=True)
 
     # Collect chunks in order and infer offsets by index*chunk_seconds.
-    import os
     from pathlib import Path
 
     chunks = sorted(Path(out_dir).glob("chunk_*.wav"))

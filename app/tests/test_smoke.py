@@ -1,0 +1,256 @@
+from __future__ import annotations
+
+import runpy
+import sys
+import tempfile
+import types
+import unittest
+from contextlib import ExitStack
+from pathlib import Path
+from unittest import mock
+
+
+APP_DIR = Path(__file__).resolve().parents[1]
+
+
+class _SessionState(dict):
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+
+class _DummyContext:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def button(self, *args, **kwargs):
+        return False
+
+    def checkbox(self, *args, value=False, **kwargs):
+        return value
+
+    def slider(self, *args, value=None, min_value=None, **kwargs):
+        return value if value is not None else min_value
+
+    def multiselect(self, *args, options=None, default=None, **kwargs):
+        return default if default is not None else (options or [])
+
+    def selectbox(self, *args, options=None, index=0, **kwargs):
+        if not options:
+            return None
+        return options[index]
+
+    def text_input(self, *args, value="", **kwargs):
+        return value
+
+    def write(self, *args, **kwargs):
+        return None
+
+    def caption(self, *args, **kwargs):
+        return None
+
+    def markdown(self, *args, **kwargs):
+        return None
+
+    def text_area(self, *args, **kwargs):
+        return None
+
+    def dataframe(self, *args, **kwargs):
+        return None
+
+    def progress(self, *args, **kwargs):
+        return self
+
+    def empty(self):
+        return self
+
+    def image(self, *args, **kwargs):
+        return None
+
+
+def _fake_streamlit_module() -> types.ModuleType:
+    module = types.ModuleType("streamlit")
+    module.session_state = _SessionState()
+    module.query_params = {}
+    module.sidebar = _DummyContext()
+    module.set_page_config = lambda *a, **k: None
+    module.markdown = lambda *a, **k: None
+    module.caption = lambda *a, **k: None
+    module.write = lambda *a, **k: None
+    module.header = lambda *a, **k: None
+    module.info = lambda *a, **k: None
+    module.error = lambda *a, **k: None
+    module.success = lambda *a, **k: None
+    module.warning = lambda *a, **k: None
+    module.audio = lambda *a, **k: None
+    module.image = lambda *a, **k: None
+    module.text_area = lambda *a, **k: None
+    module.download_button = lambda *a, **k: None
+    module.toast = lambda *a, **k: None
+    module.rerun = lambda: None
+    module.stop = lambda: None
+    module.file_uploader = lambda *a, **k: None
+    module.text_input = lambda *a, value="", **k: value
+    module.checkbox = lambda *a, value=False, **k: value
+    module.selectbox = lambda label, options, index=0, **k: options[index] if options else None
+    module.slider = lambda *a, value=None, min_value=None, **k: value if value is not None else min_value
+    module.multiselect = lambda *a, options=None, default=None, **k: default if default is not None else (options or [])
+    module.button = lambda *a, **k: False
+    module.progress = lambda *a, **k: _DummyContext()
+    module.empty = lambda: _DummyContext()
+    module.dataframe = lambda *a, **k: None
+    module.columns = lambda spec: [_DummyContext() for _ in range(spec if isinstance(spec, int) else len(spec))]
+    module.tabs = lambda labels: [_DummyContext() for _ in labels]
+    module.expander = lambda *a, **k: _DummyContext()
+    return module
+
+
+def _fake_transcriber_modules() -> dict[str, types.ModuleType]:
+    core = types.ModuleType("transcriber.core")
+
+    class _Options:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    core.TranscriptionOptions = _Options
+    core.prepare_whisper_model = lambda *a, **k: None
+    core.transcribe_file = lambda *a, **k: None
+    core.transcribe_path = lambda *a, **k: []
+
+    ffmpeg = types.ModuleType("transcriber.ffmpeg")
+    ffmpeg.ensure_ffmpeg_available = lambda: None
+    ffmpeg.probe_duration_seconds = lambda *a, **k: None
+    ffmpeg.ffmpeg_version_line = lambda: "ffmpeg"
+    ffmpeg.ffprobe_version_line = lambda: "ffprobe"
+    ffmpeg.find_ffmpeg_tools = lambda: {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe"}
+
+    hotfolder = types.ModuleType("transcriber.hotfolder")
+
+    class _Decision:
+        should_process = True
+        persist_state = False
+        signature = types.SimpleNamespace(size=0, mtime_ns=0, sha256=None)
+
+    hotfolder.decide_file_action = lambda *a, **k: _Decision()
+    hotfolder.iter_audio_files = lambda *a, **k: []
+    hotfolder.load_state = lambda *a, **k: {}
+    hotfolder.rel_key = lambda *a, **k: ""
+    hotfolder.save_state = lambda *a, **k: None
+
+    telemetry = types.ModuleType("transcriber.telemetry")
+    telemetry.get_rtf = lambda *a, **k: (1.0, 0)
+
+    return {
+        "transcriber.core": core,
+        "transcriber.ffmpeg": ffmpeg,
+        "transcriber.hotfolder": hotfolder,
+        "transcriber.telemetry": telemetry,
+    }
+
+
+class SmokeTests(unittest.TestCase):
+    def test_cli_help_exits_cleanly(self) -> None:
+        fake_core = types.ModuleType("transcriber.core")
+
+        class _Options:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        fake_core.TranscriptionOptions = _Options
+        fake_core.prepare_whisper_model = lambda *a, **k: None
+        fake_core.transcribe_path = lambda *a, **k: []
+
+        fake_ffmpeg = types.ModuleType("transcriber.ffmpeg")
+        fake_ffmpeg.ensure_ffmpeg_available = lambda: None
+
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(sys.modules, {"transcriber.core": fake_core, "transcriber.ffmpeg": fake_ffmpeg}))
+            stack.enter_context(mock.patch.object(sys, "argv", ["transcribe_cli.py", "--help"]))
+            with self.assertRaises(SystemExit) as exc:
+                runpy.run_path(str(APP_DIR / "transcribe_cli.py"), run_name="__main__")
+        self.assertEqual(exc.exception.code, 0)
+
+    def test_cli_model_preflight_failure_exits_cleanly(self) -> None:
+        fake_core = types.ModuleType("transcriber.core")
+
+        class _Options:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        fake_core.TranscriptionOptions = _Options
+        fake_core.prepare_whisper_model = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("network down"))
+        fake_core.transcribe_path = lambda *a, **k: []
+
+        fake_ffmpeg = types.ModuleType("transcriber.ffmpeg")
+        fake_ffmpeg.ensure_ffmpeg_available = lambda: None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "sample.wav"
+            input_path.write_bytes(b"wav")
+            out_dir = Path(tmp) / "out"
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(sys.modules, {"transcriber.core": fake_core, "transcriber.ffmpeg": fake_ffmpeg}))
+                stack.enter_context(
+                    mock.patch.object(
+                        sys,
+                        "argv",
+                        ["transcribe_cli.py", "--input", str(input_path), "--out", str(out_dir)],
+                    )
+                )
+                with self.assertRaises(SystemExit) as exc:
+                    runpy.run_path(str(APP_DIR / "transcribe_cli.py"), run_name="__main__")
+        self.assertIn("Could not prepare Whisper model", str(exc.exception))
+
+    def test_streamlit_app_smoke_starts_and_exposes_safe_upload_name(self) -> None:
+        fake_streamlit = _fake_streamlit_module()
+        fake_components = types.ModuleType("streamlit.components.v1")
+        fake_components.html = lambda *a, **k: None
+
+        patches = {
+            "streamlit": fake_streamlit,
+            "streamlit.components": types.ModuleType("streamlit.components"),
+            "streamlit.components.v1": fake_components,
+            **_fake_transcriber_modules(),
+        }
+        patches["streamlit.components"].v1 = fake_components
+
+        with mock.patch.dict(sys.modules, patches):
+            globals_dict = runpy.run_path(str(APP_DIR / "streamlit_app.py"), run_name="__main__")
+
+        safe_name = globals_dict["_safe_uploaded_filename"]
+        self.assertEqual(safe_name("../unsafe name.mp3", index=1), "upload_01.mp3")
+        self.assertEqual(safe_name("odd.ext", index=2), "upload_02.wav")
+
+        speaker_badge = globals_dict["_speaker_confidence_badge"]
+        self.assertEqual(speaker_badge(0.9)[0], "Speaker match: High")
+        self.assertEqual(speaker_badge(0.5)[0], "Speaker match: Medium")
+        self.assertEqual(speaker_badge(0.2)[0], "Speaker match: Low")
+
+        build_output_meta = globals_dict["_build_output_meta"]
+        meta = build_output_meta(diarization={"num_speakers": 2, "metrics": {"silhouette": 0.61}})
+        self.assertEqual(meta["diarization"]["num_speakers"], 2)
+        self.assertEqual(meta["diarization"]["metrics"]["silhouette"], 0.61)
+
+        queue_status = globals_dict["_queue_status_details"]
+        self.assertEqual(queue_status(status="Queued")[0], "🟡 Queued")
+        self.assertEqual(queue_status(status="Running")[0], "🔵 Running")
+        self.assertEqual(queue_status(status="Done", output_meta={"warnings": ["trimmed"]})[1], "Review Transcript → Diagnostics for warnings or skipped-audio counts.")
+        self.assertEqual(queue_status(status="Error", error_message="ffmpeg missing")[0], "❌ Needs FFmpeg")
+
+        hotfolder_placeholders = globals_dict["_hotfolder_placeholders"]
+        watch_example, out_example = hotfolder_placeholders()
+        self.assertTrue(watch_example)
+        self.assertTrue(out_example)
+        self.assertNotEqual(watch_example, out_example)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -8,14 +8,12 @@ from pathlib import Path
 
 from transcriber.core import TranscriptionOptions, transcribe_file, prepare_whisper_model
 from transcriber.hotfolder import (
-    FileSignature,
+    decide_file_action,
     is_settled,
     iter_audio_files,
     load_state,
     rel_key,
     save_state,
-    sha256_file,
-    stat_signature,
 )
 
 
@@ -25,7 +23,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--out", required=True, help="Output folder for transcripts/state.")
     p.add_argument("--recursive", action="store_true", help="Scan/watch subfolders.")
     p.add_argument("--once", action="store_true", help="Run a single scan then exit (no watch).")
-    p.add_argument("--hash", action="store_true", help="Use SHA256 file hashing for de-dupe (slower, safer).")
+    p.add_argument("--hash", action="store_true", help="Hash changed files before skipping duplicates (slower, safer).")
+    p.add_argument(
+        "--always-hash-before-skip",
+        action="store_true",
+        help="Hash every candidate before skipping duplicates (slowest, correctness-first).",
+    )
     p.add_argument("--model", default="small", help="Whisper model: tiny, base, small, medium, large.")
     p.add_argument("--language", default="en", help="Language code or blank for auto.")
     p.add_argument("--speakers", type=int, default=None, help="Speaker count (beta). Omit/1 disables.")
@@ -52,6 +55,7 @@ def _process_new(
     out_dir: Path,
     options: TranscriptionOptions,
     use_hash: bool,
+    always_hash_before_skip: bool,
     recursive: bool,
 ) -> int:
     folder = folder.expanduser().resolve()
@@ -61,13 +65,24 @@ def _process_new(
     state = load_state(out_dir)
     candidates = iter_audio_files(folder, recursive=bool(recursive))
     new_files: list[Path] = []
+    state_dirty = False
     for f in candidates:
         key = rel_key(folder, f)
-        sig = stat_signature(f)
-        prev = state.get(key)
-        if prev and prev.size == sig.size and prev.mtime_ns == sig.mtime_ns and (not use_hash or prev.sha256):
+        decision = decide_file_action(
+            f,
+            state.get(key),
+            use_hash=bool(use_hash),
+            always_hash_before_skip=bool(always_hash_before_skip),
+        )
+        if not decision.should_process:
+            if decision.persist_state:
+                state[key] = decision.signature
+                state_dirty = True
             continue
         new_files.append(f)
+
+    if state_dirty:
+        save_state(out_dir, state)
 
     if not new_files:
         return 0
@@ -82,14 +97,17 @@ def _process_new(
             continue
 
         key = rel_key(folder, f)
-        sig = stat_signature(f)
-        sha = sha256_file(f) if use_hash else None
-        if use_hash:
-            # If the hash matches an existing entry, skip even if timestamps changed.
-            prev = state.get(key)
-            if prev and prev.sha256 and prev.sha256 == sha:
-                state[key] = FileSignature(size=sig.size, mtime_ns=sig.mtime_ns, sha256=sha)
-                continue
+        decision = decide_file_action(
+            f,
+            state.get(key),
+            use_hash=bool(use_hash),
+            always_hash_before_skip=bool(always_hash_before_skip),
+        )
+        if not decision.should_process:
+            if decision.persist_state:
+                state[key] = decision.signature
+                save_state(out_dir, state)
+            continue
 
         _log(f"Transcribing: {f.name}")
         try:
@@ -98,7 +116,7 @@ def _process_new(
             _log(f"ERROR: {f.name}: {e}")
             continue
 
-        state[key] = FileSignature(size=sig.size, mtime_ns=sig.mtime_ns, sha256=sha)
+        state[key] = decision.signature
         save_state(out_dir, state)
         processed += 1
         _log(f"Done: {f.name}")
@@ -139,6 +157,7 @@ def main() -> int:
         out_dir=out_dir,
         options=options,
         use_hash=bool(args.hash),
+        always_hash_before_skip=bool(args.always_hash_before_skip),
         recursive=bool(args.recursive),
     )
     if args.once:
@@ -180,6 +199,7 @@ def main() -> int:
                 out_dir=out_dir,
                 options=options,
                 use_hash=bool(args.hash),
+                always_hash_before_skip=bool(args.always_hash_before_skip),
                 recursive=bool(args.recursive),
             )
 

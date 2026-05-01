@@ -83,6 +83,48 @@ def _whisper_model_file(download_root: Path, name: str) -> Path | None:
     return download_root / os.path.basename(url)
 
 
+def _model_download_error_message(name: str, err: Exception | None) -> str:
+    if err is None:
+        return (
+            f"Whisper model download failed for '{name}'. "
+            "Check your internet connection and try again, or choose a smaller model (tiny/base)."
+        )
+
+    if isinstance(err, requests.Timeout):
+        return (
+            f"Whisper model download timed out for '{name}'. "
+            "Check your internet connection and try again, or choose a smaller model (tiny/base)."
+        )
+
+    if isinstance(err, requests.ConnectionError):
+        return (
+            f"Whisper model download could not reach the model host for '{name}'. "
+            "Check DNS/firewall settings or try again on a different network."
+        )
+
+    if isinstance(err, requests.HTTPError):
+        status = getattr(getattr(err, "response", None), "status_code", None)
+        if status:
+            return (
+                f"Whisper model download failed with HTTP {status} for '{name}'. "
+                "Try again later, or choose a smaller model (tiny/base)."
+            )
+        return (
+            f"Whisper model download failed for '{name}'. "
+            "The download server returned an HTTP error; try again later."
+        )
+
+    msg = str(err).strip()
+    if "SHA256 mismatch" in msg:
+        return (
+            f"Whisper model download failed integrity checks for '{name}'. "
+            "This usually means a partial/corrupt download or a network/proxy rewriting the file. "
+            "Try again on a different network, or choose a smaller model (tiny/base)."
+        )
+
+    return f"Whisper model download failed for '{name}': {msg or err.__class__.__name__}"
+
+
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -175,11 +217,7 @@ def ensure_whisper_model_downloaded(
                 download_stats["last_error"] = str(e)
             time.sleep(0.75 * attempt)
 
-    raise RuntimeError(
-        "Whisper model download failed integrity checks (SHA256 mismatch). "
-        "This usually means a partial/corrupt download or a network/proxy rewriting the file. "
-        "Try again on a different network, or choose a smaller model (tiny/base)."
-    ) from last_err
+    raise RuntimeError(_model_download_error_message(name, last_err)) from last_err
 
 
 def prepare_whisper_model(name: str, progress_cb: ProgressCallback = None) -> None:
@@ -343,9 +381,24 @@ def transcribe_file(
         },
         "timings": {},
         "chunks": [],
-        "counts": {"segments": 0, "chunks_total": 0, "chunks_used": 0, "chunks_skipped_silence": 0},
+        "counts": {
+            "segments": 0,
+            "chunks_total": 0,
+            "chunks_used": 0,
+            "chunks_skipped_silence": 0,
+            "chunks_skipped_total": 0,
+            "chunks_skipped_vad_empty": 0,
+            "chunks_skipped_quiet": 0,
+        },
+        "summary": {"warning_count": 0, "skipped_chunks": 0},
         "warnings": [],
     }
+
+    def _append_warning(message: str | None) -> None:
+        msg = str(message or "").strip()
+        if msg and msg not in run_stats["warnings"]:
+            run_stats["warnings"].append(msg)
+
     try:
         run_stats["input_bytes"] = int(in_path.stat().st_size)
     except Exception:
@@ -393,7 +446,8 @@ def transcribe_file(
             if warnings and progress_cb:
                 progress_cb(0.0, f"Preflight: {warnings[0]}")
             if warnings:
-                run_stats["warnings"] = list(warnings)
+                for warning in warnings:
+                    _append_warning(warning)
 
             try:
                 fmt = media.get("format") if isinstance(media, dict) else None
@@ -414,6 +468,7 @@ def transcribe_file(
         pass
 
     t_model0 = time.perf_counter()
+    prepare_whisper_model(options.whisper_model, progress_cb=None)
     model = _load_whisper_model_cached(options.whisper_model)
     run_stats["timings"]["model_load_seconds"] = float(time.perf_counter() - t_model0)
 
@@ -488,6 +543,8 @@ def transcribe_file(
                 audio, trim_start = _trim_leading_trailing_silence(audio, sr=16000)
                 if audio.size == 0:
                     run_stats["counts"]["chunks_skipped_silence"] += 1
+                    run_stats["counts"]["chunks_skipped_total"] += 1
+                    run_stats["counts"]["chunks_skipped_vad_empty"] += 1
                     continue
 
             if audio.size > 0:
@@ -506,6 +563,8 @@ def transcribe_file(
 
                 if rms_db < -55.0:
                     run_stats["counts"]["chunks_skipped_silence"] += 1
+                    run_stats["counts"]["chunks_skipped_total"] += 1
+                    run_stats["counts"]["chunks_skipped_quiet"] += 1
                     continue
 
             chunk_stat["audio_seconds"] = float(audio.shape[0]) / float(sr) if audio.size else 0.0
@@ -632,8 +691,8 @@ def transcribe_file(
             if preflight_path.exists():
                 extras["preflight"] = json.loads(preflight_path.read_text(encoding="utf-8"))
             write_brief_pack(out_dir=file_out_dir, input_name=in_path.name, segments=segments_payload, extras=extras)
-        except Exception:
-            pass
+        except Exception as exc:
+            _append_warning(f"Brief pack generation failed: {exc}")
 
         # Run telemetry (best-effort): learn per-machine ETA over time.
         try:
@@ -656,6 +715,8 @@ def transcribe_file(
         try:
             run_stats["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             run_stats["timings"]["total_seconds"] = float(time.perf_counter() - t0_perf)
+            run_stats["summary"]["warning_count"] = int(len(run_stats["warnings"]))
+            run_stats["summary"]["skipped_chunks"] = int(run_stats["counts"].get("chunks_skipped_total") or 0)
             (file_out_dir / "run_stats.json").write_text(json.dumps(run_stats, indent=2), encoding="utf-8")
         except Exception:
             pass

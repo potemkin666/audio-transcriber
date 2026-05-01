@@ -12,11 +12,10 @@ labels: bug
 
 ## Logs
 
-Attach `logs/streamlit.err.log` (if present).
+Attach `app/logs/streamlit.err.log` (if present).
 
 ## Environment
 
 - OS:
 - Python:
 - TRANSCRIBER version/commit:
-
