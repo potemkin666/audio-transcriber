@@ -106,13 +106,7 @@ def _safe_uploaded_filename(name: str, *, index: int) -> str:
     suffix = Path(raw_name).suffix.lower()
     if suffix.lstrip(".") not in SUPPORTED_TYPES:
         suffix = ".wav"
-
-    stem = Path(raw_name).stem.strip().replace(" ", "_")
-    stem = "".join(ch for ch in stem if ch.isalnum() or ch in ("_", "-", "."))
-    stem = ".".join(part for part in stem.split(".") if part)
-    if not stem:
-        stem = f"upload_{index:02d}"
-    return f"{index:02d}_{stem}{suffix}"
+    return f"upload_{index:02d}{suffix}"
 
 
 def _read_json_file(path: Path) -> dict | list | None:
@@ -1032,63 +1026,15 @@ with tabs[1]:
     if scan_now:
         if not folder_path or not folder_path.exists() or not folder_path.is_dir():
             st.error("Pick an existing folder.")
-            st.stop()
-        if not out_dir_path:
+        elif not out_dir_path:
             st.error("Pick an output folder.")
-            st.stop()
-
-        out_dir_path.mkdir(parents=True, exist_ok=True)
-        state = load_state(out_dir_path)
-        files = iter_audio_files(folder_path, recursive=bool(recursive))
-        new_files: list[Path] = []
-        state_dirty = False
-        for f in files:
-            key = rel_key(folder_path, f)
-            decision = decide_file_action(
-                f,
-                state.get(key),
-                use_hash=bool(use_hash),
-                always_hash_before_skip=bool(always_hash_before_skip),
-            )
-            if not decision.should_process:
-                if decision.persist_state:
-                    state[key] = decision.signature
-                    state_dirty = True
-                continue
-            new_files.append(f)
-
-        if state_dirty:
-            save_state(out_dir_path, state)
-
-        st.write(f"Found {len(files)} audio file(s). New/changed: {len(new_files)}.")
-        if not new_files:
-            st.stop()
-
-        try:
-            ensure_ffmpeg_available()
-        except RuntimeError as e:
-            st.error(str(e))
-            st.stop()
-
-        options = TranscriptionOptions(
-            whisper_model=whisper_model,
-            language=(language.strip() or "en"),
-            chunk_seconds=600,
-            num_speakers=int(num_speakers) if (enable_speakers and speakers_available) else None,
-            retain_audio=bool(retain_audio),
-            transcript_style=transcript_style,
-            vad=bool(vad) or bool(auto_clean),
-            normalize=bool(normalize) or bool(auto_clean),
-            denoise=bool(denoise),
-            redact=bool(redact),
-        )
-        prepare_whisper_model(options.whisper_model, progress_cb=None)
-
-        bar = st.progress(0)
-        status = st.empty()
-        for i, f in enumerate(new_files, start=1):
-            status.markdown(f"**Transcribing:** `{f.name}` (`{i}/{len(new_files)}`)")
-            try:
+        else:
+            out_dir_path.mkdir(parents=True, exist_ok=True)
+            state = load_state(out_dir_path)
+            files = iter_audio_files(folder_path, recursive=bool(recursive))
+            new_files: list[Path] = []
+            state_dirty = False
+            for f in files:
                 key = rel_key(folder_path, f)
                 decision = decide_file_action(
                     f,
@@ -1099,73 +1045,115 @@ with tabs[1]:
                 if not decision.should_process:
                     if decision.persist_state:
                         state[key] = decision.signature
-                        save_state(out_dir_path, state)
+                        state_dirty = True
                     continue
-                transcribe_file(in_path=f, out_dir=out_dir_path, options=options, progress_cb=None, preview_cb=None)
-                state[key] = decision.signature
+                new_files.append(f)
+
+            if state_dirty:
                 save_state(out_dir_path, state)
-            except Exception as e:
-                st.error(f"{f.name}: {e}")
-            bar.progress(int(i / len(new_files) * 100))
-        st.success("Hot-folder scan complete.")
+
+            st.write(f"Found {len(files)} audio file(s). New/changed: {len(new_files)}.")
+            if not new_files:
+                st.info("No new or changed audio files were found for this hot-folder run.")
+            else:
+                try:
+                    ensure_ffmpeg_available()
+                except RuntimeError as e:
+                    st.error(str(e))
+                else:
+                    options = TranscriptionOptions(
+                        whisper_model=whisper_model,
+                        language=(language.strip() or "en"),
+                        chunk_seconds=600,
+                        num_speakers=int(num_speakers) if (enable_speakers and speakers_available) else None,
+                        retain_audio=bool(retain_audio),
+                        transcript_style=transcript_style,
+                        vad=bool(vad) or bool(auto_clean),
+                        normalize=bool(normalize) or bool(auto_clean),
+                        denoise=bool(denoise),
+                        redact=bool(redact),
+                    )
+                    prepare_whisper_model(options.whisper_model, progress_cb=None)
+
+                    bar = st.progress(0)
+                    status = st.empty()
+                    for i, f in enumerate(new_files, start=1):
+                        status.markdown(f"**Transcribing:** `{f.name}` (`{i}/{len(new_files)}`)")
+                        try:
+                            key = rel_key(folder_path, f)
+                            decision = decide_file_action(
+                                f,
+                                state.get(key),
+                                use_hash=bool(use_hash),
+                                always_hash_before_skip=bool(always_hash_before_skip),
+                            )
+                            if not decision.should_process:
+                                if decision.persist_state:
+                                    state[key] = decision.signature
+                                    save_state(out_dir_path, state)
+                                continue
+                            transcribe_file(in_path=f, out_dir=out_dir_path, options=options, progress_cb=None, preview_cb=None)
+                            state[key] = decision.signature
+                            save_state(out_dir_path, state)
+                        except Exception as e:
+                            st.error(f"{f.name}: {e}")
+                        bar.progress(int(i / len(new_files) * 100))
+                    st.success("Hot-folder scan complete.")
 
     if start_watch:
         if not folder_path or not folder_path.exists() or not folder_path.is_dir():
             st.error("Pick an existing folder.")
-            st.stop()
-        if not out_dir_path:
+        elif not out_dir_path:
             st.error("Pick an output folder.")
-            st.stop()
+        else:
+            proc = st.session_state.hotfolder_proc
+            if proc is not None and proc.poll() is None:
+                st.info("Watcher already running.")
+            else:
+                logs_dir = Path(__file__).parent / "logs"
+                logs_dir.mkdir(parents=True, exist_ok=True)
+                log_path = logs_dir / "hotfolder_watch.log"
 
-        proc = st.session_state.hotfolder_proc
-        if proc is not None and proc.poll() is None:
-            st.info("Watcher already running.")
-            st.stop()
+                cmd = [
+                    sys.executable,
+                    os.fspath(Path(__file__).parent / "watch_hotfolder.py"),
+                    "--folder",
+                    os.fspath(folder_path),
+                    "--out",
+                    os.fspath(out_dir_path),
+                    "--model",
+                    whisper_model,
+                    "--language",
+                    (language.strip() or "en"),
+                ]
+                if recursive:
+                    cmd.append("--recursive")
+                if use_hash:
+                    cmd.append("--hash")
+                if always_hash_before_skip:
+                    cmd.append("--always-hash-before-skip")
+                if enable_speakers and speakers_available:
+                    cmd += ["--speakers", str(int(num_speakers))]
+                cmd += ["--style", transcript_style]
+                if bool(vad) or bool(auto_clean):
+                    cmd.append("--vad")
+                if bool(normalize) or bool(auto_clean):
+                    cmd.append("--normalize")
+                if bool(denoise):
+                    cmd.append("--denoise")
+                if bool(redact):
+                    cmd.append("--redact")
 
-        logs_dir = Path(__file__).parent / "logs"
-        logs_dir.mkdir(parents=True, exist_ok=True)
-        log_path = logs_dir / "hotfolder_watch.log"
-
-        cmd = [
-            sys.executable,
-            os.fspath(Path(__file__).parent / "watch_hotfolder.py"),
-            "--folder",
-            os.fspath(folder_path),
-            "--out",
-            os.fspath(out_dir_path),
-            "--model",
-            whisper_model,
-            "--language",
-            (language.strip() or "en"),
-        ]
-        if recursive:
-            cmd.append("--recursive")
-        if use_hash:
-            cmd.append("--hash")
-        if always_hash_before_skip:
-            cmd.append("--always-hash-before-skip")
-        if enable_speakers and speakers_available:
-            cmd += ["--speakers", str(int(num_speakers))]
-        cmd += ["--style", transcript_style]
-        if bool(vad) or bool(auto_clean):
-            cmd.append("--vad")
-        if bool(normalize) or bool(auto_clean):
-            cmd.append("--normalize")
-        if bool(denoise):
-            cmd.append("--denoise")
-        if bool(redact):
-            cmd.append("--redact")
-
-        lf = log_path.open("a", encoding="utf-8")
-        lf.write("\n--- START watcher ---\n")
-        lf.flush()
-        st.session_state.hotfolder_proc = subprocess.Popen(
-            cmd,
-            stdout=lf,
-            stderr=subprocess.STDOUT,
-            cwd=Path(__file__).parent,
-        )
-        st.success("Watcher started. Leave this tab open to monitor logs.")
+                lf = log_path.open("a", encoding="utf-8")
+                lf.write("\n--- START watcher ---\n")
+                lf.flush()
+                st.session_state.hotfolder_proc = subprocess.Popen(
+                    cmd,
+                    stdout=lf,
+                    stderr=subprocess.STDOUT,
+                    cwd=Path(__file__).parent,
+                )
+                st.success("Watcher started. Leave this tab open to monitor logs.")
 
     if stop_watch:
         proc = st.session_state.hotfolder_proc
@@ -1228,72 +1216,78 @@ with tabs[2]:
 
     transcripts: dict[str, str] = st.session_state.get("last_transcripts") or {}
     outputs: dict[str, dict] = st.session_state.get("last_outputs") or {}
-    if not transcripts:
-        st.info("No transcript loaded yet. Run a transcription first, or load a saved ZIP/folder above.")
-        st.stop()
-
-    files = sorted(transcripts.keys())
-    selected = st.selectbox("File", files, index=0, key="sel_file")
-
-    text = transcripts.get(selected, "")
+    selected = ""
+    text = ""
     briefs: dict[str, dict[str, str]] = st.session_state.get("last_briefs") or {}
-    segs = (outputs.get(selected) or {}).get("segments") or []
-    stem = (outputs.get(selected) or {}).get("stem")
-    output_meta = (outputs.get(selected) or {}).get("meta") or {}
-    query = st.text_input("Search", value="", placeholder="Search segments...", key="seg_query")
-
-    warnings = output_meta.get("warnings") or []
-    skipped_total = int(output_meta.get("skipped_total") or 0)
-    skipped_vad = int(output_meta.get("skipped_vad_empty") or 0)
-    skipped_quiet = int(output_meta.get("skipped_quiet") or 0)
-    with st.expander("Diagnostics", expanded=False):
-        st.write(
-            {
-                "warning_summary": output_meta.get("warning_summary"),
-                "skipped_summary": output_meta.get("skipped_summary"),
-                "preflight": output_meta.get("preflight") or {},
-                "run_stats": output_meta.get("run_stats") or {},
-            }
-        )
-    if warnings or skipped_total:
-        st.markdown(
-            """
-            <div class="hud" style="padding:10px 12px; margin-top: 10px;">
-              <div class="micro">FILE WARNINGS</div>
-              <div class="sub">Preflight and non-fatal processing notices for the selected file.</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        for warning in warnings:
-            st.warning(warning)
-        if skipped_total:
-            detail_parts = []
-            if skipped_vad:
-                detail_parts.append(f"{skipped_vad} VAD-trimmed empty")
-            if skipped_quiet:
-                detail_parts.append(f"{skipped_quiet} ultra-quiet")
-            detail_txt = f" ({', '.join(detail_parts)})" if detail_parts else ""
-            st.info(f"Skipped chunks: {skipped_total}{detail_txt}.")
-
-    # Playback sync (best-effort).
-    zip_bytes = st.session_state.get("last_zip_bytes")
+    segs: list[dict] = []
+    stem = None
+    output_meta: dict = {}
+    query = ""
     audio_bytes: bytes | None = None
     audio_mime: str | None = None
-    if zip_bytes and stem:
-        try:
-            with zipfile.ZipFile(io.BytesIO(zip_bytes), mode="r") as zf:
-                for cand, mime in ((f"{stem}/audio_preview.mp3", "audio/mpeg"), (f"{stem}/audio.wav", "audio/wav")):
-                    try:
-                        audio_bytes = zf.read(cand)
-                        audio_mime = mime
-                        break
-                    except Exception:
-                        continue
-        except Exception:
-            audio_bytes = None
+    if not transcripts:
+        st.info("No transcript loaded yet. Run a transcription first, or load a saved ZIP/folder above.")
+    else:
+        files = sorted(transcripts.keys())
+        selected = st.selectbox("File", files, index=0, key="sel_file")
 
-    if audio_bytes:
+        text = transcripts.get(selected, "")
+        briefs = st.session_state.get("last_briefs") or {}
+        segs = (outputs.get(selected) or {}).get("segments") or []
+        stem = (outputs.get(selected) or {}).get("stem")
+        output_meta = (outputs.get(selected) or {}).get("meta") or {}
+        query = st.text_input("Search", value="", placeholder="Search segments...", key="seg_query")
+
+        warnings = output_meta.get("warnings") or []
+        skipped_total = int(output_meta.get("skipped_total") or 0)
+        skipped_vad = int(output_meta.get("skipped_vad_empty") or 0)
+        skipped_quiet = int(output_meta.get("skipped_quiet") or 0)
+        with st.expander("Diagnostics", expanded=False):
+            st.write(
+                {
+                    "warning_summary": output_meta.get("warning_summary"),
+                    "skipped_summary": output_meta.get("skipped_summary"),
+                    "preflight": output_meta.get("preflight") or {},
+                    "run_stats": output_meta.get("run_stats") or {},
+                }
+            )
+        if warnings or skipped_total:
+            st.markdown(
+                """
+                <div class="hud" style="padding:10px 12px; margin-top: 10px;">
+                  <div class="micro">FILE WARNINGS</div>
+                  <div class="sub">Preflight and non-fatal processing notices for the selected file.</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            for warning in warnings:
+                st.warning(warning)
+            if skipped_total:
+                detail_parts = []
+                if skipped_vad:
+                    detail_parts.append(f"{skipped_vad} VAD-trimmed empty")
+                if skipped_quiet:
+                    detail_parts.append(f"{skipped_quiet} ultra-quiet")
+                detail_txt = f" ({', '.join(detail_parts)})" if detail_parts else ""
+                st.info(f"Skipped chunks: {skipped_total}{detail_txt}.")
+
+        # Playback sync (best-effort).
+        zip_bytes = st.session_state.get("last_zip_bytes")
+        if zip_bytes and stem:
+            try:
+                with zipfile.ZipFile(io.BytesIO(zip_bytes), mode="r") as zf:
+                    for cand, mime in ((f"{stem}/audio_preview.mp3", "audio/mpeg"), (f"{stem}/audio.wav", "audio/wav")):
+                        try:
+                            audio_bytes = zf.read(cand)
+                            audio_mime = mime
+                            break
+                        except Exception:
+                            continue
+            except Exception:
+                audio_bytes = None
+
+    if transcripts and audio_bytes:
         # Data URI approach enables click-to-jump timestamps.
         max_embed = 12 * 1024 * 1024
         if len(audio_bytes) <= max_embed:
@@ -1332,11 +1326,11 @@ with tabs[2]:
                 unsafe_allow_html=True,
             )
             st.audio(audio_bytes)
-    else:
+    elif transcripts:
         st.caption("Playback preview is unavailable for this result set. Load the ZIP output to restore bundled audio artifacts.")
 
     # Segment-first transcript view (uses segments.json metadata).
-    if segs:
+    if transcripts and segs:
         st.markdown(
             """
             <div class="hud" style="padding:10px 12px; margin-top: 10px;">
@@ -1492,7 +1486,7 @@ with tabs[2]:
                 st.text_area("Transcript (filtered)", value=filtered, height=360)
             else:
                 st.text_area("Transcript", value=text, height=360)
-    else:
+    elif transcripts:
         # Fallback if segments.json isn't available.
         if query.strip():
             q = query.strip().lower()
@@ -1502,7 +1496,7 @@ with tabs[2]:
             st.text_area("Transcript", value=text, height=420)
 
     brief = briefs.get(selected)
-    if brief:
+    if transcripts and brief:
         if st.session_state.get("focus_brief"):
             st.session_state["focus_brief"] = False
             try:

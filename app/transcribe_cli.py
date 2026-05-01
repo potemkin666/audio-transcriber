@@ -68,8 +68,24 @@ def main() -> None:
 
     try:
         ensure_ffmpeg_available()
+    except RuntimeError as e:
+        raise SystemExit(f"Error: FFmpeg preflight failed: {e}") from None
+    except FileNotFoundError as e:
+        raise SystemExit(f"Error: FFmpeg preflight failed: {e}") from None
+
+    try:
         print(f"Preparing Whisper model '{options.whisper_model}'...", file=sys.stderr)
         prepare_whisper_model(options.whisper_model, progress_cb=None)
+    except RuntimeError as e:
+        raise SystemExit(f"Error: Could not prepare Whisper model '{options.whisper_model}': {e}") from None
+    except FileNotFoundError as e:
+        raise SystemExit(f"Error: Could not prepare Whisper model '{options.whisper_model}': {e}") from None
+    except Exception as e:
+        raise SystemExit(
+            f"Error: Unexpected failure while preparing Whisper model '{options.whisper_model}': {e}"
+        ) from None
+
+    try:
         results = transcribe_path(in_path=in_path, out_dir=out_dir, options=options, progress_cb=None)
     except RuntimeError as e:
         raise SystemExit(f"Error: {e}") from None

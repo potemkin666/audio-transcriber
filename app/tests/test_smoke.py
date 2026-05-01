@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import runpy
 import sys
+import tempfile
 import types
 import unittest
 from contextlib import ExitStack
@@ -10,10 +11,6 @@ from unittest import mock
 
 
 APP_DIR = Path(__file__).resolve().parents[1]
-
-
-class _StopApp(RuntimeError):
-    pass
 
 
 class _SessionState(dict):
@@ -99,7 +96,7 @@ def _fake_streamlit_module() -> types.ModuleType:
     module.download_button = lambda *a, **k: None
     module.toast = lambda *a, **k: None
     module.rerun = lambda: None
-    module.stop = lambda: (_ for _ in ()).throw(_StopApp())
+    module.stop = lambda: None
     module.file_uploader = lambda *a, **k: None
     module.text_input = lambda *a, value="", **k: value
     module.checkbox = lambda *a, value=False, **k: value
@@ -181,7 +178,38 @@ class SmokeTests(unittest.TestCase):
                 runpy.run_path(str(APP_DIR / "transcribe_cli.py"), run_name="__main__")
         self.assertEqual(exc.exception.code, 0)
 
-    def test_streamlit_app_smoke_starts_until_empty_state(self) -> None:
+    def test_cli_model_preflight_failure_exits_cleanly(self) -> None:
+        fake_core = types.ModuleType("transcriber.core")
+
+        class _Options:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        fake_core.TranscriptionOptions = _Options
+        fake_core.prepare_whisper_model = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("network down"))
+        fake_core.transcribe_path = lambda *a, **k: []
+
+        fake_ffmpeg = types.ModuleType("transcriber.ffmpeg")
+        fake_ffmpeg.ensure_ffmpeg_available = lambda: None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "sample.wav"
+            input_path.write_bytes(b"wav")
+            out_dir = Path(tmp) / "out"
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(sys.modules, {"transcriber.core": fake_core, "transcriber.ffmpeg": fake_ffmpeg}))
+                stack.enter_context(
+                    mock.patch.object(
+                        sys,
+                        "argv",
+                        ["transcribe_cli.py", "--input", str(input_path), "--out", str(out_dir)],
+                    )
+                )
+                with self.assertRaises(SystemExit) as exc:
+                    runpy.run_path(str(APP_DIR / "transcribe_cli.py"), run_name="__main__")
+        self.assertIn("Could not prepare Whisper model", str(exc.exception))
+
+    def test_streamlit_app_smoke_starts_and_exposes_safe_upload_name(self) -> None:
         fake_streamlit = _fake_streamlit_module()
         fake_components = types.ModuleType("streamlit.components.v1")
         fake_components.html = lambda *a, **k: None
@@ -195,8 +223,11 @@ class SmokeTests(unittest.TestCase):
         patches["streamlit.components"].v1 = fake_components
 
         with mock.patch.dict(sys.modules, patches):
-            with self.assertRaises(_StopApp):
-                runpy.run_path(str(APP_DIR / "streamlit_app.py"), run_name="__main__")
+            globals_dict = runpy.run_path(str(APP_DIR / "streamlit_app.py"), run_name="__main__")
+
+        safe_name = globals_dict["_safe_uploaded_filename"]
+        self.assertEqual(safe_name("../unsafe name.mp3", index=1), "upload_01.mp3")
+        self.assertEqual(safe_name("odd.ext", index=2), "upload_02.wav")
 
 
 if __name__ == "__main__":
