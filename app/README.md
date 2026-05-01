@@ -63,7 +63,7 @@ Prerequisites:
 
 - Python 3
 
-Run from `/home/runner/work/audio-transcriber/audio-transcriber/app`:
+Run from the `app/` directory:
 
 ```powershell
 .\Setup.cmd
@@ -84,7 +84,7 @@ Prerequisites:
 brew install python ffmpeg
 ```
 
-Run from `/home/runner/work/audio-transcriber/audio-transcriber/app`:
+Run from the `app/` directory:
 
 ```bash
 bash ./setup_unix.sh
@@ -99,7 +99,7 @@ sudo apt-get update
 sudo apt-get install -y python3 python3-venv ffmpeg
 ```
 
-Run from `/home/runner/work/audio-transcriber/audio-transcriber/app`:
+Run from the `app/` directory:
 
 ```bash
 bash ./setup_unix.sh

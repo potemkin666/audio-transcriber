@@ -1,10 +1,10 @@
 # Start Here
 
-GitHub visitors should start in `/home/runner/work/audio-transcriber/audio-transcriber/app`.
+GitHub visitors should start in the `app/` directory.
 
 ## If you just cloned or downloaded the repo
 
-1. Open `/home/runner/work/audio-transcriber/audio-transcriber/app`
+1. Open `app/`
 2. Read `README.md`
 3. Run the platform-specific setup command from that folder
 
