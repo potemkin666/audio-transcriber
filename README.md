@@ -13,24 +13,24 @@ TRANSCRIBER is a local Whisper-based app for turning audio and video files into 
 
 ### Windows
 
-1. Open `/home/runner/work/audio-transcriber/audio-transcriber/app`
+1. Open `app/`
 2. Run `Setup.cmd`
 3. Run `Launch.cmd`
 
 ### macOS / Linux
 
-1. Open `/home/runner/work/audio-transcriber/audio-transcriber/app`
+1. Open `app/`
 2. Install FFmpeg first
 3. Run `bash ./setup_unix.sh`
 
 ## Quick start from GitHub
 
-- If you downloaded a release ZIP, use the instructions in `/home/runner/work/audio-transcriber/audio-transcriber/app/README.md`
-- If you cloned the repo, start in `/home/runner/work/audio-transcriber/audio-transcriber/app`
+- If you downloaded a release ZIP, use the instructions in `app/README.md`
+- If you cloned the repo, start in `app/`
 - No environment variables are required for a standard local run
 
 ## Development notes
 
-- Existing source README: `/home/runner/work/audio-transcriber/audio-transcriber/app/README.md`
-- Existing short guide: `/home/runner/work/audio-transcriber/audio-transcriber/app/START_HERE.md`
-- Existing project map: `/home/runner/work/audio-transcriber/audio-transcriber/app/docs/PROJECT_STRUCTURE.md`
+- Existing source README: `app/README.md`
+- Existing short guide: `app/START_HERE.md`
+- Existing project map: `app/docs/PROJECT_STRUCTURE.md`
