@@ -719,8 +719,8 @@ with tabs[0]:
                     "duration": _format_duration(dur),
                     "eta": _format_eta((dur or 0.0) * float(rtf) if dur else None),
                     "status": "Queued",
-                    "warnings": "—",
-                    "skipped": "—",
+                    "warning_summary": "—",
+                    "skipped_summary": "—",
                     "output": "In final ZIP",
                 }
             )
@@ -843,8 +843,8 @@ with tabs[0]:
                                 except Exception:
                                     segs = None
                             output_meta = _load_output_meta(result.output_dir)
-                            status_rows[idx - 1]["warnings"] = output_meta["warning_summary"]
-                            status_rows[idx - 1]["skipped"] = output_meta["skipped_summary"]
+                            status_rows[idx - 1]["warning_summary"] = output_meta["warning_summary"]
+                            status_rows[idx - 1]["skipped_summary"] = output_meta["skipped_summary"]
                             outputs[uf.name] = {
                                 "stem": result.output_dir.name,
                                 "segments": segs,
