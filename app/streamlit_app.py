@@ -486,6 +486,8 @@ def _command_palette(commands: list[dict]) -> None:
             items.forEach((c, i) => {{
               const div = document.createElement('div');
               div.className = 'tr_cmd_item';
+              div.setAttribute('role', 'button');
+              div.setAttribute('tabindex', '0');
               div.style.opacity = (i===idx) ? '1.0' : '0.92';
               div.style.borderColor = (i===idx) ? 'rgba(167,240,255,0.34)' : 'rgba(167,240,255,0.10)';
               const title = document.createElement('div');
@@ -497,6 +499,12 @@ def _command_palette(commands: list[dict]) -> None:
               div.appendChild(title);
               div.appendChild(desc);
               div.onclick = () => run(c);
+              div.onkeydown = (event) => {{
+                if (event.key === 'Enter' || event.key === ' ') {{
+                  event.preventDefault();
+                  run(c);
+                }}
+              }};
               list.appendChild(div);
             }});
             overlay.dataset.items = JSON.stringify(items);
@@ -1262,8 +1270,11 @@ with tabs[1]:
                             transcribe_file(in_path=f, out_dir=out_dir_path, options=options, progress_cb=None, preview_cb=None)
                             state[key] = decision.signature
                             save_state(out_dir_path, state)
-                        except Exception as e:
-                            st.error(f"{f.name}: {e}")
+                        except Exception:
+                            st.error(
+                                f"Failed to transcribe `{f.name}`. Check dependencies, output-folder access, "
+                                "or settings, then retry."
+                            )
                         bar.progress(int(i / len(new_files) * 100))
                     st.success("Hot-folder scan complete.")
 
@@ -1379,8 +1390,10 @@ with tabs[2]:
             st.session_state.last_outputs = outputs
             st.session_state.last_zip_bytes = zip_bytes
             st.success(f"Loaded {len(transcripts)} transcript output(s).")
-        except Exception as exc:
-            st.error(f"Could not load saved outputs: {exc}")
+        except Exception:
+            st.error(
+                "Could not load saved outputs. Verify the path or ZIP is correct and that it contains valid transcript files."
+            )
 
     transcripts: dict[str, str] = st.session_state.get("last_transcripts") or {}
     outputs: dict[str, dict] = st.session_state.get("last_outputs") or {}
