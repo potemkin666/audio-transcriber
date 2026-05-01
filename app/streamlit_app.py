@@ -24,6 +24,7 @@ from transcriber.telemetry import get_rtf
 
 
 SUPPORTED_TYPES = ["mp3", "m4a", "mp4", "aac", "wav", "flac", "ogg", "m4b", "webm"]
+ENABLE_COMMAND_PALETTE = False
 
 
 def _zip_dir(root: Path) -> bytes:
@@ -107,6 +108,103 @@ def _safe_uploaded_filename(name: str, *, index: int) -> str:
     if suffix.lstrip(".") not in SUPPORTED_TYPES:
         suffix = ".wav"
     return f"upload_{index:02d}{suffix}"
+
+
+def _copy_text_widget(*, key: str, label: str, value: str, height: int = 140) -> None:
+    dom_id = _safe_dom_id(key, prefix="copy")
+    st.text_area(label, value=value, height=height, key=f"{dom_id}_value")
+    payload = base64.b64encode(value.encode("utf-8")).decode("ascii")
+    components.html(
+        f"""
+        <div style="margin:-4px 0 4px;">
+          <button id="{dom_id}_btn" type="button" aria-label="Copy {label} to clipboard"
+            style="width:100%; padding:10px 12px; border-radius:14px; border:1px solid rgba(167,240,255,0.18);
+                   background: rgba(255,255,255,0.06); color: rgba(236,243,255,0.92);
+                   letter-spacing:0.06em; text-transform:uppercase; cursor:pointer;">
+            Copy
+          </button>
+          <div id="{dom_id}_status" role="status" aria-live="polite"
+            style="margin-top:6px; color:rgba(185,212,255,0.75); font-size:12px;">
+            Tip: the text box also supports standard keyboard copy shortcuts.
+          </div>
+        </div>
+        <script>
+          (function(){{
+            const btn = document.getElementById("{dom_id}_btn");
+            const status = document.getElementById("{dom_id}_status");
+            const decoded = atob("{payload}");
+            async function copyText() {{
+              try {{
+                if (navigator.clipboard && navigator.clipboard.writeText) {{
+                  await navigator.clipboard.writeText(decoded);
+                }} else {{
+                  const ta = document.createElement("textarea");
+                  ta.value = decoded;
+                  ta.setAttribute("readonly", "");
+                  ta.style.position = "fixed";
+                  ta.style.opacity = "0";
+                  document.body.appendChild(ta);
+                  ta.select();
+                  document.execCommand("copy");
+                  document.body.removeChild(ta);
+                }}
+                if (status) status.textContent = "Copied to clipboard.";
+                if (btn) btn.textContent = "Copied";
+                setTimeout(() => {{
+                  if (status) status.textContent = "Tip: the text box also supports standard keyboard copy shortcuts.";
+                  if (btn) btn.textContent = "Copy";
+                }}, 1200);
+              }} catch (err) {{
+                if (status) status.textContent = "Copy failed. Use Ctrl+C or Cmd+C from the text box.";
+                if (btn) btn.textContent = "Copy failed";
+                setTimeout(() => {{
+                  if (btn) btn.textContent = "Copy";
+                }}, 1400);
+              }}
+            }}
+            if (btn) {{
+              btn.addEventListener("click", copyText);
+              btn.addEventListener("keydown", (event) => {{
+                if (event.key === "Enter" || event.key === " ") {{
+                  event.preventDefault();
+                  copyText();
+                }}
+              }});
+            }}
+          }})();
+        </script>
+        """,
+        height=78,
+    )
+
+
+def _queue_status_details(*, status: str, error_message: str | None = None, output_meta: dict | None = None) -> tuple[str, str]:
+    normalized = str(status or "").strip().lower()
+    if normalized == "queued":
+        return "🟡 Queued", "Ready to start. Press Transcribe when the queue looks right."
+    if normalized == "running":
+        return "🔵 Running", "Wait for this file to finish. Live preview updates during transcription."
+    if normalized == "done":
+        meta = output_meta if isinstance(output_meta, dict) else {}
+        if (meta.get("warnings") or []) or int(meta.get("skipped_total") or 0):
+            return "✅ Done", "Review Transcript → Diagnostics for warnings or skipped-audio counts."
+        return "✅ Done", "Included in the final ZIP."
+
+    msg = str(error_message or "").strip()
+    lower = msg.lower()
+    if "ffmpeg" in lower or "ffprobe" in lower:
+        return "❌ Needs FFmpeg", "Install FFmpeg or rerun setup, then retry this file."
+    if "speaker labeling requires extra deps" in lower or "requirements-speakers" in lower or "speechbrain" in lower:
+        return "❌ Speaker setup", "Install speaker-label dependencies or turn speaker labels off and retry."
+    if "download" in lower or "network" in lower or "http" in lower or "timeout" in lower or "connection" in lower:
+        return "❌ Retry download", "Retry after the model download finishes, or choose a smaller model."
+    return "❌ Needs attention", "Retry this file. If it fails again, check Build info or adjust model/settings."
+
+
+def _hotfolder_placeholders() -> tuple[str, str]:
+    if os.name == "nt":
+        return (r"C:\Users\you\Desktop\incoming-audio", r"C:\Users\you\Desktop\incoming-audio\_transcripts")
+    return ("~/Desktop/incoming-audio", "~/Desktop/incoming-audio/_transcripts")
 
 
 def _read_json_file(path: Path) -> dict | list | None:
@@ -698,32 +796,33 @@ for i in range(1, 7):
 for f in recent_files:
     cmds.append({"title": f"Select file: {f}", "desc": "Set Transcript view file selector", "cmd": "select_file", "arg": f})
 
-_command_palette(cmds)
+if ENABLE_COMMAND_PALETTE:
+    _command_palette(cmds)
 
-# Execute palette commands via query params (best-effort).
-cmd = _get_qp("cmd")
-arg = _get_qp("arg")
-if cmd:
-    try:
-        if cmd == "toggle_redact":
-            st.session_state["opt_redact"] = not bool(st.session_state.get("opt_redact", False))
-        elif cmd == "low_conf":
-            st.session_state["seg_low_only"] = True
-            st.session_state["seg_min_conf"] = 0.0
-            st.session_state["seg_low_threshold"] = 0.35
-        elif cmd == "speaker" and arg:
-            st.session_state["seg_speaker_filter"] = [str(arg)]
-        elif cmd == "select_file" and arg:
-            st.session_state["sel_file"] = str(arg)
-        elif cmd == "transcribe":
-            st.session_state["auto_transcribe"] = True
-        elif cmd == "brief":
-            st.session_state["focus_brief"] = True
-    except Exception:
-        pass
-    _clear_qp("cmd")
-    _clear_qp("arg")
-    st.rerun()
+    # Execute palette commands via query params (best-effort).
+    cmd = _get_qp("cmd")
+    arg = _get_qp("arg")
+    if cmd:
+        try:
+            if cmd == "toggle_redact":
+                st.session_state["opt_redact"] = not bool(st.session_state.get("opt_redact", False))
+            elif cmd == "low_conf":
+                st.session_state["seg_low_only"] = True
+                st.session_state["seg_min_conf"] = 0.0
+                st.session_state["seg_low_threshold"] = 0.35
+            elif cmd == "speaker" and arg:
+                st.session_state["seg_speaker_filter"] = [str(arg)]
+            elif cmd == "select_file" and arg:
+                st.session_state["sel_file"] = str(arg)
+            elif cmd == "transcribe":
+                st.session_state["auto_transcribe"] = True
+            elif cmd == "brief":
+                st.session_state["focus_brief"] = True
+        except Exception:
+            pass
+        _clear_qp("cmd")
+        _clear_qp("arg")
+        st.rerun()
 
 with st.sidebar:
     st.header("Settings")
@@ -817,6 +916,18 @@ with st.sidebar:
 
 with tabs[0]:
     uploaded = st.file_uploader("Drop audio files here", type=SUPPORTED_TYPES, accept_multiple_files=True)
+    st.markdown(
+        f"""
+        <div class="brief-note" style="margin-top:10px;">
+          <strong>First-run checklist</strong><br>
+          Supported inputs: <code>{", ".join('.' + ext for ext in SUPPORTED_TYPES)}</code>.<br>
+          Files stay local; practical size limits depend on your free disk space and RAM.<br>
+          The first run may take longer while the selected Whisper model downloads and prepares.<br>
+          ETA appears after duration probing and improves over time using local speed telemetry.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     if uploaded:
         st.markdown(
             """
@@ -855,13 +966,15 @@ with tabs[0]:
             if dur:
                 total_audio_seconds += float(dur)
                 total_eta_seconds += float(dur) * float(rtf)
+            status_badge, next_step = _queue_status_details(status="Queued")
             queue_rows.append(
                 {
                     "file": uf.name,
                     "size_mb": round(len(uf.getbuffer()) / (1024 * 1024), 2),
                     "duration": _format_duration(dur),
                     "eta": _format_eta((dur or 0.0) * float(rtf) if dur else None),
-                    "status": "Queued",
+                    "status": status_badge,
+                    "next_step": next_step,
                     "warning_summary": "—",
                     "skipped_summary": "—",
                     "output": "In final ZIP",
@@ -932,7 +1045,7 @@ with tabs[0]:
                         status_rows = [{**r} for r in queue_rows]
 
                         for idx, uf in enumerate(uploaded, start=1):
-                            status_rows[idx - 1]["status"] = "Running"
+                            status_rows[idx - 1]["status"], status_rows[idx - 1]["next_step"] = _queue_status_details(status="Running")
                             table.dataframe(status_rows, use_container_width=True, hide_index=True)
 
                             status.markdown(f"**File:** `{uf.name}`  \n`{idx}/{total}`")
@@ -962,7 +1075,10 @@ with tabs[0]:
                                     preview_cb=_preview_cb,
                                 )
                             except RuntimeError as e:
-                                status_rows[idx - 1]["status"] = "Error"
+                                status_rows[idx - 1]["status"], status_rows[idx - 1]["next_step"] = _queue_status_details(
+                                    status="Error", error_message=str(e)
+                                )
+                                status_rows[idx - 1]["output"] = "Not written"
                                 table.dataframe(status_rows, use_container_width=True, hide_index=True)
                                 st.error(str(e))
                                 break
@@ -988,13 +1104,16 @@ with tabs[0]:
                             output_meta = _load_output_meta(result.output_dir)
                             status_rows[idx - 1]["warning_summary"] = output_meta["warning_summary"]
                             status_rows[idx - 1]["skipped_summary"] = output_meta["skipped_summary"]
+                            status_rows[idx - 1]["status"], status_rows[idx - 1]["next_step"] = _queue_status_details(
+                                status="Done", output_meta=output_meta
+                            )
+                            status_rows[idx - 1]["output"] = result.output_dir.name
                             outputs[uf.name] = {
                                 "stem": result.output_dir.name,
                                 "segments": segs,
                                 "meta": output_meta,
                             }
 
-                            status_rows[idx - 1]["status"] = "Done"
                             table.dataframe(status_rows, use_container_width=True, hide_index=True)
 
                             file_bar.progress(100)
@@ -1033,11 +1152,13 @@ with tabs[1]:
         unsafe_allow_html=True,
     )
 
-    folder = st.text_input("Folder to watch", value="", placeholder=r"C:\path\to\folder")
-    out_dir = st.text_input("Output folder", value="", placeholder=r"(default: <folder>\\_transcripts)")
+    folder_example, out_example = _hotfolder_placeholders()
+    folder = st.text_input("Folder to watch", value="", placeholder=folder_example)
+    out_dir = st.text_input("Output folder", value="", placeholder=out_example)
     recursive = st.checkbox("Include subfolders", value=True)
     use_hash = st.checkbox("Hash changed files before skip (safer, slower)", value=False)
     always_hash_before_skip = st.checkbox("Always hash before skip (correctness-first, slowest)", value=False)
+    st.caption(f"Examples: watch `{folder_example}` • output `{out_example}`")
     st.caption(
         "Default de-duplication skips files by size + modified time. Hash modes add extra disk I/O but catch copied/replaced-file edge cases more reliably."
     )
@@ -1061,11 +1182,17 @@ with tabs[1]:
     else:
         out_dir_path = Path(out_dir).expanduser() if out_dir.strip() else None
 
+    if folder_path:
+        st.caption(f"Watch folder resolves to `{folder_path.resolve(strict=False)}`")
+    if out_dir_path:
+        st.caption(f"Output folder resolves to `{out_dir_path.resolve(strict=False)}`")
+
     if scan_now:
         if not folder_path or not folder_path.exists() or not folder_path.is_dir():
-            st.error("Pick an existing folder.")
+            detail = f" Current value resolves to `{folder_path.resolve(strict=False)}`." if folder_path else ""
+            st.error(f"Pick an existing folder.{detail}")
         elif not out_dir_path:
-            st.error("Pick an output folder.")
+            st.error("Pick an output folder. Leave it blank to use the default `_transcripts` folder.")
         else:
             out_dir_path.mkdir(parents=True, exist_ok=True)
             state = load_state(out_dir_path)
@@ -1090,7 +1217,7 @@ with tabs[1]:
             if state_dirty:
                 save_state(out_dir_path, state)
 
-            st.write(f"Found {len(files)} audio file(s). New/changed: {len(new_files)}.")
+            st.write(f"Found {len(files)} audio file(s). New/changed: {len(new_files)}. Output: `{out_dir_path.resolve(strict=False)}`.")
             if not new_files:
                 st.info("No new or changed audio files were found for this hot-folder run.")
             else:
@@ -1140,9 +1267,10 @@ with tabs[1]:
 
     if start_watch:
         if not folder_path or not folder_path.exists() or not folder_path.is_dir():
-            st.error("Pick an existing folder.")
+            detail = f" Current value resolves to `{folder_path.resolve(strict=False)}`." if folder_path else ""
+            st.error(f"Pick an existing folder.{detail}")
         elif not out_dir_path:
-            st.error("Pick an output folder.")
+            st.error("Pick an output folder. Leave it blank to use the default `_transcripts` folder.")
         else:
             proc = st.session_state.hotfolder_proc
             if proc is not None and proc.poll() is None:
@@ -1191,7 +1319,7 @@ with tabs[1]:
                     stderr=subprocess.STDOUT,
                     cwd=Path(__file__).parent,
                 )
-                st.success("Watcher started. Leave this tab open to monitor logs.")
+                st.success(f"Watcher started. Outputs go to `{out_dir_path.resolve(strict=False)}`. Leave this tab open to monitor logs.")
 
     if stop_watch:
         proc = st.session_state.hotfolder_proc
@@ -1589,36 +1717,8 @@ with tabs[2]:
 
         email_txt = str(brief.get("email") or "").strip()
         wa_txt = str(brief.get("whatsapp") or "").strip()
-
-        def _copy_widget(key: str, label: str, value: str) -> None:
-            display = _html.escape(value)
-            dom_id = _safe_dom_id(key)
-            js_value = json.dumps(value)
-            st.markdown(
-                f"""
-                <div style="margin-top:10px;">
-                  <div class="micro" style="margin-bottom:6px;">{label}</div>
-                  <button id="{dom_id}_btn" style="width:100%; padding:10px 12px; border-radius:14px; border:1px solid rgba(167,240,255,0.18); background: rgba(255,255,255,0.06); color: rgba(236,243,255,0.92); letter-spacing:0.06em; text-transform:uppercase;">
-                    Copy
-                  </button>
-                  <pre id="{dom_id}_txt" style="white-space:pre-wrap; word-break:break-word; margin-top:10px; background: rgba(0,0,0,0.18); border:1px solid rgba(167,240,255,0.14); border-radius:14px; padding:12px 12px; color: rgba(236,243,255,0.92);">{display}</pre>
-                </div>
-                <script>
-                  (function(){{
-                    const btn = document.getElementById("{dom_id}_btn");
-                    const txt = {js_value};
-                    if(btn) btn.onclick = async () => {{
-                      try {{ await navigator.clipboard.writeText(txt); btn.textContent = "Copied"; setTimeout(()=>btn.textContent="Copy", 900); }}
-                      catch(e) {{ btn.textContent = "Copy failed"; setTimeout(()=>btn.textContent="Copy", 1200); }}
-                    }};
-                  }})();
-                </script>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        _copy_widget(f"email_{selected}".replace(".", "_"), "Email-ready", email_txt)
-        _copy_widget(f"wa_{selected}".replace(".", "_"), "WhatsApp-ready", wa_txt)
+        _copy_text_widget(key=f"email_{selected}".replace(".", "_"), label="Email-ready", value=email_txt)
+        _copy_text_widget(key=f"wa_{selected}".replace(".", "_"), label="WhatsApp-ready", value=wa_txt)
 
         # Link to brief.html if present in the ZIP output
         st.caption("Also saved per file as `brief.md` and `brief.html` inside the output ZIP.")

@@ -239,6 +239,18 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(meta["diarization"]["num_speakers"], 2)
         self.assertEqual(meta["diarization"]["metrics"]["silhouette"], 0.61)
 
+        queue_status = globals_dict["_queue_status_details"]
+        self.assertEqual(queue_status(status="Queued")[0], "🟡 Queued")
+        self.assertEqual(queue_status(status="Running")[0], "🔵 Running")
+        self.assertEqual(queue_status(status="Done", output_meta={"warnings": ["trimmed"]})[1], "Review Transcript → Diagnostics for warnings or skipped-audio counts.")
+        self.assertEqual(queue_status(status="Error", error_message="ffmpeg missing")[0], "❌ Needs FFmpeg")
+
+        hotfolder_placeholders = globals_dict["_hotfolder_placeholders"]
+        watch_example, out_example = hotfolder_placeholders()
+        self.assertTrue(watch_example)
+        self.assertTrue(out_example)
+        self.assertNotEqual(watch_example, out_example)
+
 
 if __name__ == "__main__":
     unittest.main()
