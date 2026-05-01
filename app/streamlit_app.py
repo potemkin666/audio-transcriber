@@ -95,6 +95,25 @@ def _clear_qp(name: str) -> None:
             pass
 
 
+def _safe_dom_id(value: str, *, prefix: str = "tr") -> str:
+    cleaned = "".join(ch if ch.isalnum() else "_" for ch in str(value or ""))
+    cleaned = cleaned.strip("_")[:80]
+    return f"{prefix}_{cleaned or 'item'}"
+
+
+def _safe_uploaded_filename(name: str, *, index: int) -> str:
+    raw_name = Path(str(name or "")).name
+    suffix = Path(raw_name).suffix.lower()
+    if suffix.lstrip(".") not in SUPPORTED_TYPES:
+        suffix = ".wav"
+
+    stem = Path(raw_name).stem.strip().replace(" ", "_")
+    stem = "".join(ch for ch in stem if ch.isalnum() or ch in ("_", "-", "."))
+    if not stem:
+        stem = f"upload_{index:02d}"
+    return f"{index:02d}_{stem}{suffix}"
+
+
 def _command_palette(commands: list[dict]) -> None:
     payload = json.dumps(commands)
     components.html(
@@ -154,7 +173,14 @@ def _command_palette(commands: list[dict]) -> None:
               div.className = 'tr_cmd_item';
               div.style.opacity = (i===idx) ? '1.0' : '0.92';
               div.style.borderColor = (i===idx) ? 'rgba(167,240,255,0.34)' : 'rgba(167,240,255,0.10)';
-              div.innerHTML = `<div class="tr_cmd_title">${{c.title}}</div><div class="tr_cmd_desc">${{c.desc||''}}</div>`;
+              const title = document.createElement('div');
+              title.className = 'tr_cmd_title';
+              title.textContent = c.title || '';
+              const desc = document.createElement('div');
+              desc.className = 'tr_cmd_desc';
+              desc.textContent = c.desc || '';
+              div.appendChild(title);
+              div.appendChild(desc);
               div.onclick = () => run(c);
               list.appendChild(div);
             }});
@@ -583,204 +609,201 @@ with st.sidebar:
 
 with tabs[0]:
     uploaded = st.file_uploader("Drop audio files here", type=SUPPORTED_TYPES, accept_multiple_files=True)
-
-    if not uploaded:
-        st.info("Upload one or more audio files to start.")
-        st.stop()
-
-    st.markdown(
-        """
-        <div class="hud" style="padding:10px 12px; margin-top: 10px;">
-          <div class="micro">QUEUE</div>
-          <div class="sub">Files are processed in order. Outputs are bundled into one ZIP at the end.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    if "dur_cache" not in st.session_state:
-        st.session_state.dur_cache = {}
-
-    queue_rows = []
-    speakers_on = bool(enable_speakers and speakers_available and int(num_speakers) > 1)
-    rtf, samples = get_rtf(model=whisper_model, speakers=speakers_on)
-    throughput = (1.0 / float(rtf)) if (rtf and rtf > 0) else 0.0
-    eta_note = f"ETA uses learned speed (samples={samples})" if samples else "ETA uses default speed (no telemetry yet)"
-    total_audio_seconds = 0.0
-    total_eta_seconds = 0.0
-    for uf in uploaded:
-        buf = uf.getbuffer()
-        cache_key = f"{uf.name}|{len(buf)}"
-        dur = st.session_state.dur_cache.get(cache_key)
-        if dur is None:
-            try:
-                with tempfile.NamedTemporaryFile(prefix="transcriber-dur-", suffix=Path(uf.name).suffix, delete=True) as tmpf:
-                    tmpf.write(buf)
-                    tmpf.flush()
-                    dur = probe_duration_seconds(tmpf.name)
-            except Exception:
-                dur = None
-            st.session_state.dur_cache[cache_key] = dur
-
-        if dur:
-            total_audio_seconds += float(dur)
-            total_eta_seconds += float(dur) * float(rtf)
-        queue_rows.append(
-            {
-                "file": uf.name,
-                "size_mb": round(len(uf.getbuffer()) / (1024 * 1024), 2),
-                "duration": _format_duration(dur),
-                "eta": _format_eta((dur or 0.0) * float(rtf) if dur else None),
-                "status": "Queued",
-                "output": "In final ZIP",
-            }
+    if uploaded:
+        st.markdown(
+            """
+            <div class="hud" style="padding:10px 12px; margin-top: 10px;">
+              <div class="micro">QUEUE</div>
+              <div class="sub">Files are processed in order. Outputs are bundled into one ZIP at the end.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-    st.dataframe(queue_rows, use_container_width=True, hide_index=True)
-    st.caption(
-        f"Model `{whisper_model}` • Throughput ~`{throughput:.2f}x` realtime • {eta_note}. "
-        f"Estimate: `{_format_eta(total_eta_seconds)}` for `{_format_duration(total_audio_seconds)}` of audio on this machine."
-    )
 
-    start = st.button("Transcribe", type="primary", use_container_width=True)
-    if st.session_state.get("auto_transcribe"):
-        start = True
-        st.session_state["auto_transcribe"] = False
+        if "dur_cache" not in st.session_state:
+            st.session_state.dur_cache = {}
 
-    if not start:
-        st.caption("Press Transcribe when ready.")
-        st.stop()
-
-    try:
-        ensure_ffmpeg_available()
-    except RuntimeError as e:
-        st.error(str(e))
-        st.stop()
-
-    options = TranscriptionOptions(
-        whisper_model=whisper_model,
-        language=language.strip() or "en",
-        chunk_seconds=600,
-        num_speakers=int(num_speakers) if (enable_speakers and speakers_available) else None,
-        retain_audio=bool(retain_audio),
-        transcript_style=transcript_style,
-        vad=bool(vad) or bool(auto_clean),
-        normalize=bool(normalize) or bool(auto_clean),
-        denoise=bool(denoise),
-        redact=bool(redact),
-    )
-
-    with tempfile.TemporaryDirectory(prefix="transcriber-") as tmp:
-        tmp_dir = Path(tmp)
-        out_dir = tmp_dir / "out"
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        total = len(uploaded)
-        overall_bar = st.progress(0)
-        file_bar = st.progress(0)
-        status = st.empty()
-        preview = st.empty()
-        table = st.empty()
-
-        status.markdown("**Preparing model...**")
-        prep_bar = st.progress(0)
-
-        def _prep_cb(p: float, msg: str) -> None:
-            prep_bar.progress(int(max(0.0, min(1.0, float(p))) * 100))
-            if msg:
-                status.markdown(f"**Preparing model...** {msg}")
-
-        try:
-            prepare_whisper_model(options.whisper_model, progress_cb=_prep_cb)
-        except Exception as e:
-            st.error(str(e))
-            st.stop()
-        prep_bar.progress(100)
-
-        transcripts: dict[str, str] = {}
-        briefs: dict[str, dict[str, str]] = {}
-        outputs: dict[str, dict] = {}
-        status_rows = [{**r} for r in queue_rows]
-
-        for idx, uf in enumerate(uploaded, start=1):
-            status_rows[idx - 1]["status"] = "Running"
-            table.dataframe(status_rows, use_container_width=True, hide_index=True)
-
-            status.markdown(f"**File:** `{uf.name}`  \n`{idx}/{total}`")
-            file_bar.progress(0)
-            preview.text_area("Live preview", value="", height=220)
-
-            audio_path = tmp_dir / uf.name
-            audio_path.write_bytes(uf.getbuffer())
-
-            def _preview_cb(t: str) -> None:
-                preview.text_area("Live preview", value=t, height=220)
-
-            def _progress_cb(p: float, msg: str) -> None:
-                p = max(0.0, min(1.0, float(p)))
-                file_bar.progress(int(p * 100))
-                overall_p = (idx - 1 + p) / max(1, total)
-                overall_bar.progress(int(overall_p * 100))
-                if msg:
-                    status.markdown(f"**File:** `{uf.name}`  \n`{idx}/{total}` - {msg}")
-
-            try:
-                result = transcribe_file(
-                    in_path=audio_path,
-                    out_dir=out_dir,
-                    options=options,
-                    progress_cb=_progress_cb,
-                    preview_cb=_preview_cb,
-                )
-            except RuntimeError as e:
-                status_rows[idx - 1]["status"] = "Error"
-                table.dataframe(status_rows, use_container_width=True, hide_index=True)
-                st.error(str(e))
-                st.stop()
-
-            transcript_path = result.output_dir / "transcript.txt"
-            if transcript_path.exists():
-                transcripts[uf.name] = transcript_path.read_text(encoding="utf-8", errors="replace")
-
-            snippets_path = result.output_dir / "brief_snippets.json"
-            if snippets_path.exists():
+        queue_rows = []
+        speakers_on = bool(enable_speakers and speakers_available and int(num_speakers) > 1)
+        rtf, samples = get_rtf(model=whisper_model, speakers=speakers_on)
+        throughput = (1.0 / float(rtf)) if (rtf and rtf > 0) else 0.0
+        eta_note = f"ETA uses learned speed (samples={samples})" if samples else "ETA uses default speed (no telemetry yet)"
+        total_audio_seconds = 0.0
+        total_eta_seconds = 0.0
+        for uf in uploaded:
+            buf = uf.getbuffer()
+            cache_key = f"{uf.name}|{len(buf)}"
+            dur = st.session_state.dur_cache.get(cache_key)
+            if dur is None:
                 try:
-                    briefs[uf.name] = json.loads(snippets_path.read_text(encoding="utf-8"))
+                    with tempfile.NamedTemporaryFile(prefix="transcriber-dur-", suffix=Path(uf.name).suffix, delete=True) as tmpf:
+                        tmpf.write(buf)
+                        tmpf.flush()
+                        dur = probe_duration_seconds(tmpf.name)
                 except Exception:
-                    pass
+                    dur = None
+                st.session_state.dur_cache[cache_key] = dur
 
-            seg_path = result.output_dir / "segments.json"
-            segs = None
-            if seg_path.exists():
-                try:
-                    segs = json.loads(seg_path.read_text(encoding="utf-8"))
-                except Exception:
-                    segs = None
-            outputs[uf.name] = {"stem": result.output_dir.name, "segments": segs}
-
-            status_rows[idx - 1]["status"] = "Done"
-            table.dataframe(status_rows, use_container_width=True, hide_index=True)
-
-            file_bar.progress(100)
-            overall_bar.progress(int(idx / total * 100))
-
-        status.markdown("**Done.**")
-        zip_bytes = _zip_dir(out_dir)
-
-        st.session_state.last_zip_bytes = zip_bytes
-        st.session_state.last_transcripts = transcripts
-        st.session_state.last_briefs = briefs
-        st.session_state.last_outputs = outputs
-
-        st.success("Transcription complete.")
-        st.download_button(
-            label="Download transcripts (.zip)",
-            data=zip_bytes,
-            file_name="transcripts.zip",
-            mime="application/zip",
-        )
+            if dur:
+                total_audio_seconds += float(dur)
+                total_eta_seconds += float(dur) * float(rtf)
+            queue_rows.append(
+                {
+                    "file": uf.name,
+                    "size_mb": round(len(uf.getbuffer()) / (1024 * 1024), 2),
+                    "duration": _format_duration(dur),
+                    "eta": _format_eta((dur or 0.0) * float(rtf) if dur else None),
+                    "status": "Queued",
+                    "output": "In final ZIP",
+                }
+            )
+        st.dataframe(queue_rows, use_container_width=True, hide_index=True)
         st.caption(
-            "Outputs include transcript.txt (timestamps + speakers), transcript_plain.txt, segments.json, transcript.srt, transcript.vtt per file."
+            f"Model `{whisper_model}` • Throughput ~`{throughput:.2f}x` realtime • {eta_note}. "
+            f"Estimate: `{_format_eta(total_eta_seconds)}` for `{_format_duration(total_audio_seconds)}` of audio on this machine."
         )
+
+        start = st.button("Transcribe", type="primary", use_container_width=True)
+        if st.session_state.get("auto_transcribe"):
+            start = True
+            st.session_state["auto_transcribe"] = False
+
+        if not start:
+            st.caption("Press Transcribe when ready.")
+        else:
+            try:
+                ensure_ffmpeg_available()
+            except RuntimeError as e:
+                st.error(str(e))
+            else:
+                options = TranscriptionOptions(
+                    whisper_model=whisper_model,
+                    language=language.strip() or "en",
+                    chunk_seconds=600,
+                    num_speakers=int(num_speakers) if (enable_speakers and speakers_available) else None,
+                    retain_audio=bool(retain_audio),
+                    transcript_style=transcript_style,
+                    vad=bool(vad) or bool(auto_clean),
+                    normalize=bool(normalize) or bool(auto_clean),
+                    denoise=bool(denoise),
+                    redact=bool(redact),
+                )
+
+                with tempfile.TemporaryDirectory(prefix="transcriber-") as tmp:
+                    tmp_dir = Path(tmp)
+                    out_dir = tmp_dir / "out"
+                    out_dir.mkdir(parents=True, exist_ok=True)
+
+                    total = len(uploaded)
+                    overall_bar = st.progress(0)
+                    file_bar = st.progress(0)
+                    status = st.empty()
+                    preview = st.empty()
+                    table = st.empty()
+
+                    status.markdown("**Preparing model...**")
+                    prep_bar = st.progress(0)
+
+                    def _prep_cb(p: float, msg: str) -> None:
+                        prep_bar.progress(int(max(0.0, min(1.0, float(p))) * 100))
+                        if msg:
+                            status.markdown(f"**Preparing model...** {msg}")
+
+                    try:
+                        prepare_whisper_model(options.whisper_model, progress_cb=_prep_cb)
+                    except Exception as e:
+                        st.error(str(e))
+                    else:
+                        prep_bar.progress(100)
+
+                        transcripts: dict[str, str] = {}
+                        briefs: dict[str, dict[str, str]] = {}
+                        outputs: dict[str, dict] = {}
+                        status_rows = [{**r} for r in queue_rows]
+
+                        for idx, uf in enumerate(uploaded, start=1):
+                            status_rows[idx - 1]["status"] = "Running"
+                            table.dataframe(status_rows, use_container_width=True, hide_index=True)
+
+                            status.markdown(f"**File:** `{uf.name}`  \n`{idx}/{total}`")
+                            file_bar.progress(0)
+                            preview.text_area("Live preview", value="", height=220)
+
+                            audio_path = tmp_dir / _safe_uploaded_filename(uf.name, index=idx)
+                            audio_path.write_bytes(uf.getbuffer())
+
+                            def _preview_cb(t: str) -> None:
+                                preview.text_area("Live preview", value=t, height=220)
+
+                            def _progress_cb(p: float, msg: str) -> None:
+                                p = max(0.0, min(1.0, float(p)))
+                                file_bar.progress(int(p * 100))
+                                overall_p = (idx - 1 + p) / max(1, total)
+                                overall_bar.progress(int(overall_p * 100))
+                                if msg:
+                                    status.markdown(f"**File:** `{uf.name}`  \n`{idx}/{total}` - {msg}")
+
+                            try:
+                                result = transcribe_file(
+                                    in_path=audio_path,
+                                    out_dir=out_dir,
+                                    options=options,
+                                    progress_cb=_progress_cb,
+                                    preview_cb=_preview_cb,
+                                )
+                            except RuntimeError as e:
+                                status_rows[idx - 1]["status"] = "Error"
+                                table.dataframe(status_rows, use_container_width=True, hide_index=True)
+                                st.error(str(e))
+                                break
+
+                            transcript_path = result.output_dir / "transcript.txt"
+                            if transcript_path.exists():
+                                transcripts[uf.name] = transcript_path.read_text(encoding="utf-8", errors="replace")
+
+                            snippets_path = result.output_dir / "brief_snippets.json"
+                            if snippets_path.exists():
+                                try:
+                                    briefs[uf.name] = json.loads(snippets_path.read_text(encoding="utf-8"))
+                                except Exception:
+                                    pass
+
+                            seg_path = result.output_dir / "segments.json"
+                            segs = None
+                            if seg_path.exists():
+                                try:
+                                    segs = json.loads(seg_path.read_text(encoding="utf-8"))
+                                except Exception:
+                                    segs = None
+                            outputs[uf.name] = {"stem": result.output_dir.name, "segments": segs}
+
+                            status_rows[idx - 1]["status"] = "Done"
+                            table.dataframe(status_rows, use_container_width=True, hide_index=True)
+
+                            file_bar.progress(100)
+                            overall_bar.progress(int(idx / total * 100))
+                        else:
+                            status.markdown("**Done.**")
+                            zip_bytes = _zip_dir(out_dir)
+
+                            st.session_state.last_zip_bytes = zip_bytes
+                            st.session_state.last_transcripts = transcripts
+                            st.session_state.last_briefs = briefs
+                            st.session_state.last_outputs = outputs
+
+                            st.success("Transcription complete.")
+                            st.download_button(
+                                label="Download transcripts (.zip)",
+                                data=zip_bytes,
+                                file_name="transcripts.zip",
+                                mime="application/zip",
+                            )
+                            st.caption(
+                                "Outputs include transcript.txt (timestamps + speakers), transcript_plain.txt, segments.json, transcript.srt, transcript.vtt per file."
+                            )
+    else:
+        st.info("Upload one or more audio files to start.")
+        st.caption("You can still use the Hot folder and Transcript tabs without uploading first.")
 
 with tabs[1]:
     st.markdown(
@@ -1209,25 +1232,21 @@ with tabs[2]:
 
         def _copy_widget(key: str, label: str, value: str) -> None:
             display = _html.escape(value)
-            js = (
-                value.replace("\\", "\\\\")
-                .replace("`", "\\`")
-                .replace("${", "\\${")
-                .replace("</script", "<\\/script")
-            )
+            dom_id = _safe_dom_id(key)
+            js_value = json.dumps(value)
             st.markdown(
                 f"""
                 <div style="margin-top:10px;">
                   <div class="micro" style="margin-bottom:6px;">{label}</div>
-                  <button id="{key}_btn" style="width:100%; padding:10px 12px; border-radius:14px; border:1px solid rgba(167,240,255,0.18); background: rgba(255,255,255,0.06); color: rgba(236,243,255,0.92); letter-spacing:0.06em; text-transform:uppercase;">
+                  <button id="{dom_id}_btn" style="width:100%; padding:10px 12px; border-radius:14px; border:1px solid rgba(167,240,255,0.18); background: rgba(255,255,255,0.06); color: rgba(236,243,255,0.92); letter-spacing:0.06em; text-transform:uppercase;">
                     Copy
                   </button>
-                  <pre id="{key}_txt" style="white-space:pre-wrap; word-break:break-word; margin-top:10px; background: rgba(0,0,0,0.18); border:1px solid rgba(167,240,255,0.14); border-radius:14px; padding:12px 12px; color: rgba(236,243,255,0.92);">{display}</pre>
+                  <pre id="{dom_id}_txt" style="white-space:pre-wrap; word-break:break-word; margin-top:10px; background: rgba(0,0,0,0.18); border:1px solid rgba(167,240,255,0.14); border-radius:14px; padding:12px 12px; color: rgba(236,243,255,0.92);">{display}</pre>
                 </div>
                 <script>
                   (function(){{
-                    const btn = document.getElementById("{key}_btn");
-                    const txt = `{js}`;
+                    const btn = document.getElementById("{dom_id}_btn");
+                    const txt = {js_value};
                     if(btn) btn.onclick = async () => {{
                       try {{ await navigator.clipboard.writeText(txt); btn.textContent = "Copied"; setTimeout(()=>btn.textContent="Copy", 900); }}
                       catch(e) {{ btn.textContent = "Copy failed"; setTimeout(()=>btn.textContent="Copy", 1200); }}

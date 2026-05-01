@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
-from transcriber.core import TranscriptionOptions, transcribe_path
+from transcriber.core import TranscriptionOptions, prepare_whisper_model, transcribe_path
+from transcriber.ffmpeg import ensure_ffmpeg_available
 
 
 def _parse_args() -> argparse.Namespace:
@@ -59,9 +61,20 @@ def main() -> None:
 
     in_path = Path(args.input).expanduser()
     out_dir = Path(args.out).expanduser()
+    if not in_path.exists():
+        raise SystemExit(f"Error: input path not found: {in_path}")
+
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    results = transcribe_path(in_path=in_path, out_dir=out_dir, options=options, progress_cb=None)
+    try:
+        ensure_ffmpeg_available()
+        print(f"Preparing Whisper model '{options.whisper_model}'...", file=sys.stderr)
+        prepare_whisper_model(options.whisper_model, progress_cb=None)
+        results = transcribe_path(in_path=in_path, out_dir=out_dir, options=options, progress_cb=None)
+    except RuntimeError as e:
+        raise SystemExit(f"Error: {e}") from None
+    except FileNotFoundError as e:
+        raise SystemExit(f"Error: {e}") from None
 
     print(f"Done. Wrote {len(results)} transcript(s) to: {out_dir}")
     for r in results:

@@ -7,6 +7,9 @@ on:
 jobs:
   syntax:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -14,4 +17,3 @@ jobs:
           python-version: "3.11"
       - name: Syntax check
         run: python -m compileall -q streamlit_app.py transcribe_cli.py transcriber
-

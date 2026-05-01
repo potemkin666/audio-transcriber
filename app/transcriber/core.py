@@ -83,6 +83,48 @@ def _whisper_model_file(download_root: Path, name: str) -> Path | None:
     return download_root / os.path.basename(url)
 
 
+def _model_download_error_message(name: str, err: Exception | None) -> str:
+    if err is None:
+        return (
+            f"Whisper model download failed for '{name}'. "
+            "Check your internet connection and try again, or choose a smaller model (tiny/base)."
+        )
+
+    if isinstance(err, requests.Timeout):
+        return (
+            f"Whisper model download timed out for '{name}'. "
+            "Check your internet connection and try again, or choose a smaller model (tiny/base)."
+        )
+
+    if isinstance(err, requests.ConnectionError):
+        return (
+            f"Whisper model download could not reach the model host for '{name}'. "
+            "Check DNS/firewall settings or try again on a different network."
+        )
+
+    if isinstance(err, requests.HTTPError):
+        status = getattr(getattr(err, "response", None), "status_code", None)
+        if status:
+            return (
+                f"Whisper model download failed with HTTP {status} for '{name}'. "
+                "Try again later, or choose a smaller model (tiny/base)."
+            )
+        return (
+            f"Whisper model download failed for '{name}'. "
+            "The download server returned an HTTP error; try again later."
+        )
+
+    msg = str(err).strip()
+    if "SHA256 mismatch" in msg:
+        return (
+            f"Whisper model download failed integrity checks for '{name}'. "
+            "This usually means a partial/corrupt download or a network/proxy rewriting the file. "
+            "Try again on a different network, or choose a smaller model (tiny/base)."
+        )
+
+    return f"Whisper model download failed for '{name}': {msg or err.__class__.__name__}"
+
+
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -175,11 +217,7 @@ def ensure_whisper_model_downloaded(
                 download_stats["last_error"] = str(e)
             time.sleep(0.75 * attempt)
 
-    raise RuntimeError(
-        "Whisper model download failed integrity checks (SHA256 mismatch). "
-        "This usually means a partial/corrupt download or a network/proxy rewriting the file. "
-        "Try again on a different network, or choose a smaller model (tiny/base)."
-    ) from last_err
+    raise RuntimeError(_model_download_error_message(name, last_err)) from last_err
 
 
 def prepare_whisper_model(name: str, progress_cb: ProgressCallback = None) -> None:
