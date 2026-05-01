@@ -24,6 +24,7 @@ from transcriber.telemetry import get_rtf
 
 
 SUPPORTED_TYPES = ["mp3", "m4a", "mp4", "aac", "wav", "flac", "ogg", "m4b", "webm"]
+# Keep the experimental command palette out of the public UI until onboarding and accessibility are stronger.
 ENABLE_COMMAND_PALETTE = False
 
 
@@ -1119,6 +1120,7 @@ with tabs[0]:
                             file_bar.progress(100)
                             overall_bar.progress(int(idx / total * 100))
                         else:
+                            # Runs only if every file completed without hitting the RuntimeError break above.
                             status.markdown("**Done.**")
                             zip_bytes = _zip_dir(out_dir)
 
