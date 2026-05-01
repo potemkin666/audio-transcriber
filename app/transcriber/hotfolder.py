@@ -94,6 +94,13 @@ def decide_file_action(
     use_hash: bool,
     always_hash_before_skip: bool = False,
 ) -> FileDecision:
+    """
+    Decide whether a hot-folder file should be processed.
+
+    When always_hash_before_skip is enabled, every candidate file is hashed
+    before deciding whether to skip it. This is the most correctness-focused
+    mode, but it adds extra disk I/O even for unchanged files.
+    """
     sig = stat_signature(p)
     same_meta = bool(previous and previous.size == sig.size and previous.mtime_ns == sig.mtime_ns)
 
