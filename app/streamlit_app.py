@@ -115,6 +115,70 @@ def _safe_uploaded_filename(name: str, *, index: int) -> str:
     return f"{index:02d}_{stem}{suffix}"
 
 
+def _read_json_file(path: Path) -> dict | list | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        item = str(value or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def _load_output_meta(output_dir: Path) -> dict:
+    preflight = _read_json_file(output_dir / "preflight.json")
+    run_stats = _read_json_file(output_dir / "run_stats.json")
+
+    preflight_warnings = []
+    if isinstance(preflight, dict):
+        preflight_warnings = [str(w).strip() for w in (preflight.get("warnings") or []) if str(w).strip()]
+
+    run_warnings = []
+    counts: dict = {}
+    if isinstance(run_stats, dict):
+        run_warnings = [str(w).strip() for w in (run_stats.get("warnings") or []) if str(w).strip()]
+        counts = run_stats.get("counts") if isinstance(run_stats.get("counts"), dict) else {}
+
+    warnings = _dedupe_preserve_order(preflight_warnings + run_warnings)
+    skipped_vad = int(counts.get("chunks_skipped_vad_empty") or 0)
+    skipped_quiet = int(counts.get("chunks_skipped_quiet") or 0)
+    skipped_total = int(counts.get("chunks_skipped_total") or counts.get("chunks_skipped_silence") or (skipped_vad + skipped_quiet))
+
+    warning_summary = "—"
+    if warnings:
+        warning_summary = warnings[0] if len(warnings) == 1 else f"{warnings[0]} (+{len(warnings) - 1} more)"
+
+    skipped_summary = "—"
+    if skipped_total:
+        details = []
+        if skipped_vad:
+            details.append(f"{skipped_vad} VAD-empty")
+        if skipped_quiet:
+            details.append(f"{skipped_quiet} ultra-quiet")
+        detail_txt = f" ({', '.join(details)})" if details else ""
+        skipped_summary = f"{skipped_total}{detail_txt}"
+
+    return {
+        "preflight": preflight if isinstance(preflight, dict) else {},
+        "run_stats": run_stats if isinstance(run_stats, dict) else {},
+        "warnings": warnings,
+        "warning_summary": warning_summary,
+        "skipped_total": skipped_total,
+        "skipped_vad_empty": skipped_vad,
+        "skipped_quiet": skipped_quiet,
+        "skipped_summary": skipped_summary,
+    }
+
+
 def _command_palette(commands: list[dict]) -> None:
     payload = json.dumps(commands)
     components.html(
@@ -655,6 +719,8 @@ with tabs[0]:
                     "duration": _format_duration(dur),
                     "eta": _format_eta((dur or 0.0) * float(rtf) if dur else None),
                     "status": "Queued",
+                    "warnings": "—",
+                    "skipped": "—",
                     "output": "In final ZIP",
                 }
             )
@@ -776,7 +842,14 @@ with tabs[0]:
                                     segs = json.loads(seg_path.read_text(encoding="utf-8"))
                                 except Exception:
                                     segs = None
-                            outputs[uf.name] = {"stem": result.output_dir.name, "segments": segs}
+                            output_meta = _load_output_meta(result.output_dir)
+                            status_rows[idx - 1]["warnings"] = output_meta["warning_summary"]
+                            status_rows[idx - 1]["skipped"] = output_meta["skipped_summary"]
+                            outputs[uf.name] = {
+                                "stem": result.output_dir.name,
+                                "segments": segs,
+                                "meta": output_meta,
+                            }
 
                             status_rows[idx - 1]["status"] = "Done"
                             table.dataframe(status_rows, use_container_width=True, hide_index=True)
@@ -1000,7 +1073,33 @@ with tabs[2]:
     briefs: dict[str, dict[str, str]] = st.session_state.get("last_briefs") or {}
     segs = (outputs.get(selected) or {}).get("segments") or []
     stem = (outputs.get(selected) or {}).get("stem")
+    output_meta = (outputs.get(selected) or {}).get("meta") or {}
     query = st.text_input("Search", value="", placeholder="Search segments...", key="seg_query")
+
+    warnings = output_meta.get("warnings") or []
+    skipped_total = int(output_meta.get("skipped_total") or 0)
+    skipped_vad = int(output_meta.get("skipped_vad_empty") or 0)
+    skipped_quiet = int(output_meta.get("skipped_quiet") or 0)
+    if warnings or skipped_total:
+        st.markdown(
+            """
+            <div class="hud" style="padding:10px 12px; margin-top: 10px;">
+              <div class="micro">FILE WARNINGS</div>
+              <div class="sub">Preflight and non-fatal processing notices for the selected file.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        for warning in warnings:
+            st.warning(warning)
+        if skipped_total:
+            detail_parts = []
+            if skipped_vad:
+                detail_parts.append(f"{skipped_vad} VAD-trimmed empty")
+            if skipped_quiet:
+                detail_parts.append(f"{skipped_quiet} ultra-quiet")
+            detail_txt = f" ({', '.join(detail_parts)})" if detail_parts else ""
+            st.info(f"Skipped chunks: {skipped_total}{detail_txt}.")
 
     # Playback sync (best-effort).
     zip_bytes = st.session_state.get("last_zip_bytes")
